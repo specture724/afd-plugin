@@ -109,6 +109,9 @@ def register_afd() -> None:
         import afd_plugin.compat.patches.async_dp_forward_context  # noqa: F401
         import afd_plugin.compat.patches.config_validation  # noqa: F401
         import afd_plugin.compat.patches.engine_core  # noqa: F401
+        from afd_plugin.compat.patches import apply_omni_server_patch
+
+        apply_omni_server_patch()
     except Exception:
         _logger.debug(
             "AFD plugin: compatibility patches could not be applied",
