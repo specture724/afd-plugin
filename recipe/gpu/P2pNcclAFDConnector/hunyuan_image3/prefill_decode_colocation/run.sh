@@ -12,7 +12,7 @@
 set -euo pipefail
 
 MODE="${1:-graph}"
-MODEL_PATH="${MODEL_PATH:-/path/model_weights/DeepSeek-V2-Lite}"
+MODEL_PATH="${MODEL_PATH:-/dev/shm/hyimage3/snapshots/2ec2c78bee7d4b94157341fba86c4c2c7b1858b2/}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GEN_DIR="$SCRIPT_DIR/.generated/$MODE"
 
@@ -43,7 +43,7 @@ stages:
     tensor_parallel_size: 2
     enable_expert_parallel: true
     max_num_seqs: 64
-    gpu_memory_utilization: 0.75
+    gpu_memory_utilization: 0.95
     trust_remote_code: true
 $COMPILATION
     enable_prefix_caching: false
@@ -68,30 +68,32 @@ $COMPILATION
 
     additional_config:
       afd:
-        enabled: true
         role: "$role"
-        connector: "p2pconnector"
-        num_attention_servers: 2
-        num_ffn_servers: 2
-        extra_config:
-          afd_size: "2A2F"
+        connector: "P2pNcclAFDConnector"
+        num_attention_ranks: 2
+        num_ffn_ranks: 2
+        host: "127.0.0.1"
+        port: 6269
 EOF
 }
-
+ATTN_DEVICES="0,1"
+FFN_DEVICES="2,3"
 mkdir -p "$GEN_DIR"
-render attention afd_plugin.v1.worker.AFDAttentionWorker "0,1" 18300 > "$GEN_DIR/attn.yaml"
-render ffn       afd_plugin.v1.worker.AFDFFNWorker       "2,3" 18301 > "$GEN_DIR/ffn.yaml"
+render attention afd_plugin.v1.worker.AFDAttentionWorker $ATTN_DEVICES 18300 > "$GEN_DIR/attn.yaml"
+render ffn       afd_plugin.v1.worker.AFDFFNWorker       $FFN_DEVICES 18301 > "$GEN_DIR/ffn.yaml"
 
-CUDA_VISIBLE_DEVICES=0,1 uv run vllm serve "$MODEL_PATH" \
-    --host 127.0.0.1 \
-    --port 18300 \
-    --omni \
-    --deploy-config "$GEN_DIR/attn.yaml" > attn.log 2>&1 &
+# export NCCL_DEBUG=WARN
 
-CUDA_VISIBLE_DEVICES=2,3 uv run vllm serve "$MODEL_PATH" \
+CUDA_VISIBLE_DEVICES=$FFN_DEVICES uv run vllm serve "$MODEL_PATH" \
     --host 127.0.0.1 \
     --port 18301 \
     --omni \
     --deploy-config "$GEN_DIR/ffn.yaml" > ffn.log 2>&1 &
 
+sleep 15
+CUDA_VISIBLE_DEVICES=$ATTN_DEVICES uv run vllm serve "$MODEL_PATH" \
+    --host 127.0.0.1 \
+    --port 18300 \
+    --omni \
+    --deploy-config "$GEN_DIR/attn.yaml" > attn.log 2>&1 &
 wait

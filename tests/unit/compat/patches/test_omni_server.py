@@ -28,24 +28,52 @@ def _install_fake_resolve_deploy_yaml(monkeypatch, mapping):
 
 
 def test_top_level_additional_config_dict_ffn():
-    args = SimpleNamespace(additional_config={"afd": {"enabled": True, "role": "ffn"}})
+    args = SimpleNamespace(additional_config={"afd": {"role": "ffn"}})
+    assert _is_ffn_args(args) is True
+
+
+def test_top_level_additional_config_full_schema_ffn():
+    # A complete current-schema block (canonical field names) must be detected.
+    args = SimpleNamespace(
+        additional_config={
+            "afd": {
+                "role": "ffn",
+                "connector": "P2pNcclAFDConnector",
+                "num_attention_ranks": 2,
+                "num_ffn_ranks": 2,
+            }
+        }
+    )
     assert _is_ffn_args(args) is True
 
 
 def test_top_level_additional_config_json_string_ffn():
-    args = SimpleNamespace(additional_config='{"afd": {"enabled": true, "role": "ffn"}}')
+    args = SimpleNamespace(additional_config='{"afd": {"role": "ffn"}}')
     assert _is_ffn_args(args) is True
 
 
 def test_top_level_attention_role_is_not_ffn():
-    args = SimpleNamespace(additional_config={"afd": {"enabled": True, "role": "attention"}})
+    args = SimpleNamespace(additional_config={"afd": {"role": "attention"}})
+    assert _is_ffn_args(args) is False
+
+
+def test_legacy_enabled_field_is_rejected(monkeypatch):
+    # The obsolete ``enabled`` flag is an unknown field under the current schema;
+    # the engine would reject it, so the omni patch must not treat it as FFN.
+    args = SimpleNamespace(additional_config={"afd": {"enabled": True, "role": "ffn"}})
     assert _is_ffn_args(args) is False
 
 
 def test_deploy_config_stage_ffn(monkeypatch):
     _install_fake_resolve_deploy_yaml(
         monkeypatch,
-        {"ffn.yaml": {"stages": [{"stage_id": 0, "additional_config": {"afd": {"enabled": True, "role": "ffn"}}}]}},
+        {
+            "ffn.yaml": {
+                "stages": [
+                    {"stage_id": 0, "additional_config": {"afd": {"role": "ffn"}}}
+                ]
+            }
+        },
     )
     args = SimpleNamespace(deploy_config="ffn.yaml", stage_configs_path=None)
     assert _is_ffn_args(args) is True
@@ -54,7 +82,13 @@ def test_deploy_config_stage_ffn(monkeypatch):
 def test_deploy_config_stage_attention_is_not_ffn(monkeypatch):
     _install_fake_resolve_deploy_yaml(
         monkeypatch,
-        {"attn.yaml": {"stages": [{"stage_id": 0, "additional_config": {"afd": {"enabled": True, "role": "attention"}}}]}},
+        {
+            "attn.yaml": {
+                "stages": [
+                    {"stage_id": 0, "additional_config": {"afd": {"role": "attention"}}}
+                ]
+            }
+        },
     )
     args = SimpleNamespace(deploy_config="attn.yaml", stage_configs_path=None)
     assert _is_ffn_args(args) is False
@@ -63,12 +97,20 @@ def test_deploy_config_stage_attention_is_not_ffn(monkeypatch):
 def test_stage_configs_path_ffn(monkeypatch):
     _install_fake_resolve_deploy_yaml(
         monkeypatch,
-        {"legacy.yaml": {"stages": [{"stage_id": 0, "additional_config": {"afd": {"enabled": True, "role": "ffn"}}}]}},
+        {
+            "legacy.yaml": {
+                "stages": [
+                    {"stage_id": 0, "additional_config": {"afd": {"role": "ffn"}}}
+                ]
+            }
+        },
     )
     args = SimpleNamespace(deploy_config=None, stage_configs_path="legacy.yaml")
     assert _is_ffn_args(args) is True
 
 
 def test_no_afd_config_is_not_ffn():
-    args = SimpleNamespace(deploy_config=None, stage_configs_path=None, additional_config=None)
+    args = SimpleNamespace(
+        deploy_config=None, stage_configs_path=None, additional_config=None
+    )
     assert _is_ffn_args(args) is False

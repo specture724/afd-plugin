@@ -18,11 +18,16 @@ from itertools import islice
 from typing import Any
 
 import torch
+from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models import hunyuan_v1 as native
 from vllm_omni.model_executor.models.hunyuan_image3 import hunyuan_image3 as himg
 
-from afd_plugin.connectors import AFDConnectorMetadata
+from afd_plugin.connectors import (
+    AFDForwardContextMetadata,
+    AFDTransferContext,
+    AFDTransferMetadata,
+)
 from afd_plugin.model_executor.models import (
     get_afd_metadata_from_forward_context,
 )
@@ -73,7 +78,7 @@ class AFDHunYuanModel(ImageHunyuanModel):
     only swaps the decoder layer class and overrides ``forward``.
     """
 
-    def __init__(self, *, vllm_config: object, prefix: str = "") -> None:
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         # Build the upstream model but with the AFD-aware decoder layer so each
         # layer exposes compute_attn_output / compute_ffn_output.
         original_layer = native.HunYuanDecoderLayer
@@ -139,12 +144,12 @@ class AFDHunYuanModel(ImageHunyuanModel):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor,
-        afd_metadata: object,
+        afd_metadata: AFDForwardContextMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        afd_connector = afd_metadata.afd_connector
+        afd_connector = afd_metadata.connector
         forward_context = get_forward_context()
         stage_idx = int(
-            getattr(forward_context, "ubatch_idx", afd_metadata.afd_stage_idx),
+            getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
         )
         cla_factor = native._get_cla_factor(self.config)
         prev_kv_states = None
@@ -153,10 +158,9 @@ class AFDHunYuanModel(ImageHunyuanModel):
             islice(self.layers, self.start_layer, self.end_layer),
         ):
             stage_idx = int(
-                getattr(forward_context, "ubatch_idx", afd_metadata.afd_stage_idx),
+                getattr(forward_context, "ubatch_idx", afd_metadata.stage_idx),
             )
-            afd_metadata.ubatch_idx = stage_idx
-            afd_metadata.afd_stage_idx = stage_idx
+            afd_metadata.stage_idx = stage_idx
             if layer_offset > 0:
                 hidden_states = afd_connector.recv_ffn_output(
                     ref_tensor=hidden_states,
@@ -169,12 +173,13 @@ class AFDHunYuanModel(ImageHunyuanModel):
                 residual,
                 prev_kv_states,
             )
-            metadata = AFDConnectorMetadata.create_attention_metadata(
+            metadata = AFDTransferMetadata.create_attention_metadata(
                 layer_idx=layer.layer_id,
                 stage_idx=stage_idx,
                 seq_len=int(hidden_states.shape[0]),
             )
-            afd_connector.send_attn_output(hidden_states, metadata)
+            context = AFDTransferContext(metadata=metadata)
+            afd_connector.send_attn_output(hidden_states, context)
             hidden_states = maybe_apply_dbo_yield(
                 hidden_states,
                 role="attention",
@@ -211,7 +216,7 @@ class AFDHunyuanImage3ForConditionalGeneration(ImageForConditionalGeneration):
     the inner model for :class:`AFDHunYuanModel` and exposes ``compute_ffn_output``.
     """
 
-    def __init__(self, *, vllm_config: object, prefix: str = "") -> None:
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         # The upstream __init__ hardcodes ``self.model = HunyuanModel(...)``
         # referencing the module global. Swap it so the AFD inner model is built,
         # then everything else (VAE/ViT/lm_head, _patch_moe_blocks,

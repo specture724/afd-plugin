@@ -24,9 +24,13 @@ simple asyncio wait-for-signal loop so that:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
+from collections.abc import Mapping
 from typing import Any
+
+from afd_plugin.config import AFD_ADDITIONAL_CONFIG_KEY, afd_config_from_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +92,14 @@ def _is_ffn_args(args: Any) -> bool:
 
 
 def _afd_dict_is_ffn(additional: Any) -> bool:
-    """Return True when an ``additional_config`` value selects the FFN role."""
+    """Return True when an ``additional_config`` value selects the FFN role.
+
+    AFD is active whenever the ``afd`` block is present (the current schema has
+    no ``enabled`` flag), so the role is read through the plugin's own config
+    parser. This keeps alias handling and field validation consistent with the
+    engine-side parsing in ``afd_plugin.config`` and ``compat.patches``; a block
+    that the engine would reject is treated as "not FFN" here as well.
+    """
     if isinstance(additional, str):
         try:
             import json
@@ -96,12 +107,16 @@ def _afd_dict_is_ffn(additional: Any) -> bool:
             additional = json.loads(additional)
         except Exception:
             return False
-    if not isinstance(additional, dict):
+    if not isinstance(additional, Mapping):
         return False
-    afd = additional.get("afd", {})
-    if not isinstance(afd, dict):
+    afd_raw = additional.get(AFD_ADDITIONAL_CONFIG_KEY)
+    if not isinstance(afd_raw, Mapping):
         return False
-    return bool(afd.get("enabled", False)) and afd.get("role") == "ffn"
+    try:
+        config = afd_config_from_mapping(afd_raw, validate=False)
+    except Exception:
+        return False
+    return config.role == "ffn"
 
 
 def _deploy_config_is_ffn(path: Any) -> bool:
@@ -125,7 +140,7 @@ def _deploy_config_is_ffn(path: Any) -> bool:
 
             if not (isinstance(path, str) and os.path.isfile(path)):
                 return False
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 raw = yaml.safe_load(fh)
         except Exception:
             return False
@@ -161,11 +176,8 @@ async def _run_ffn_daemon(args: Any, server_mod: Any) -> None:
             shutdown_event.set()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
+        with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, _set_shutdown)
-        except (NotImplementedError, RuntimeError):
-            # Signal handlers are not supported on all platforms / event loops.
-            pass
 
     try:
         async with build_async_omni(args) as _engine:
