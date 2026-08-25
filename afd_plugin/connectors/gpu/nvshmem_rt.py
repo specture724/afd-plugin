@@ -106,6 +106,23 @@ def _load_library() -> ctypes.CDLL:
     lib.nvshmem_ptr.restype = ctypes.c_void_p
     lib.nvshmem_my_pe.restype = ctypes.c_int
     lib.nvshmem_n_pes.restype = ctypes.c_int
+    lib.nvshmemx_putmem_on_stream.argtypes = [
+        ctypes.c_void_p,  # dest
+        ctypes.c_void_p,  # source
+        ctypes.c_size_t,  # bytes
+        ctypes.c_int,  # pe
+        ctypes.c_void_p,  # cudaStream_t
+    ]
+    lib.nvshmemx_putmem_on_stream.restype = None
+    lib.nvshmemx_int32_p_on_stream.argtypes = [
+        ctypes.c_void_p,  # dest (int32_t*)
+        ctypes.c_int32,  # value, passed by value -- no source buffer needed
+        ctypes.c_int,  # pe
+        ctypes.c_void_p,  # cudaStream_t
+    ]
+    lib.nvshmemx_int32_p_on_stream.restype = None
+    lib.nvshmemx_quiet_on_stream.argtypes = [ctypes.c_void_p]  # cudaStream_t
+    lib.nvshmemx_quiet_on_stream.restype = None
     return lib
 
 
@@ -203,15 +220,83 @@ def malloc(nbytes: int) -> int:
 
 
 def peer_ptr(local_ptr: int, pe: int) -> int:
-    """Map a peer's copy of a symmetric allocation into this process."""
+    """Map a peer's copy of a symmetric allocation into this process.
+
+    Unused by the write path: ``put_on_stream`` addresses a destination PE
+    without a local mapping of its memory, which is what makes it work across
+    nodes. Kept as a primitive for a possible future fast path that writes
+    directly through a mapping when ``pe`` happens to be P2P-reachable.
+    """
     pointer = _require_lib().nvshmem_ptr(ctypes.c_void_p(local_ptr), pe)
     if not pointer:
         raise RuntimeError(
-            f"nvshmem_ptr returned NULL for PE {pe}: no direct peer access. "
-            "The async GPU connector requires PEs reachable over NVLink/P2P; "
-            "cross-node placement is not supported.",
+            f"nvshmem_ptr returned NULL for PE {pe}: no direct peer access.",
         )
     return int(pointer)
+
+
+def put_on_stream(dest_ptr: int, source: torch.Tensor, *, pe: int, stream: int) -> None:
+    """One-sided write of ``source`` into PE ``pe``'s window at ``dest_ptr``.
+
+    ``dest_ptr`` is this rank's own address for the destination symmetric
+    object -- the same value every PE computes for its own copy of the
+    window, the way ``malloc`` hands back one consistent address that every
+    PE plugs into the same formula. NVSHMEM resolves it to the physical
+    location on ``pe`` internally, over NVLink/P2P or over the network
+    depending on reachability, so the caller never needs to know which.
+
+    ``source`` must be a contiguous, device-resident tensor; NVSHMEM's
+    on-stream put reads it directly, with no implicit dtype cast and no
+    implicit gather -- callers must already have done both.
+    """
+    if not source.is_contiguous():
+        raise ValueError("put_on_stream requires a contiguous source tensor")
+    nbytes = source.numel() * source.element_size()
+    if nbytes == 0:
+        return
+    _require_lib().nvshmemx_putmem_on_stream(
+        ctypes.c_void_p(dest_ptr),
+        ctypes.c_void_p(source.data_ptr()),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(pe),
+        ctypes.c_void_p(stream),
+    )
+
+
+def put_scalar_i32_on_stream(
+    dest_ptr: int, value: int, *, pe: int, stream: int
+) -> None:
+    """One-sided write of a single int32 into PE ``pe``'s window.
+
+    ``value`` travels as an immediate, not through a source buffer -- this is
+    what the flag write uses in place of a local ``.fill_()`` into a mapped
+    peer view.
+    """
+    _require_lib().nvshmemx_int32_p_on_stream(
+        ctypes.c_void_p(dest_ptr),
+        ctypes.c_int32(value),
+        ctypes.c_int(pe),
+        ctypes.c_void_p(stream),
+    )
+
+
+def fence_on_stream(stream: int) -> None:
+    """Order this PE's prior puts before whatever is enqueued after.
+
+    Same-stream issue order was enough to make "the flag is visible" imply
+    "the payload is visible" when every write was a same-engine
+    device-to-device copy (see ``symm_window.py``'s module docstring); once a
+    write can be a put over the network, two independent puts to the same PE
+    carry no such guarantee and need an explicit order point between them.
+
+    NVSHMEM's host API exposes no stream-enqueued ``fence`` (only the
+    device-side one), so this reaches for the next cheapest thing it does
+    expose, ``quiet`` -- which waits for local completion of every
+    outstanding put rather than merely ordering them. Correct, and probably
+    stronger than what dispatch actually needs; revisit if it shows up as a
+    stall once there is a cross-node deployment to profile.
+    """
+    _require_lib().nvshmemx_quiet_on_stream(ctypes.c_void_p(stream))
 
 
 class _DeviceBuffer:
@@ -262,9 +347,12 @@ def tensor_from_ptr(
 
 
 __all__ = [
+    "fence_on_stream",
     "init",
     "is_initialized",
     "malloc",
     "peer_ptr",
+    "put_on_stream",
+    "put_scalar_i32_on_stream",
     "tensor_from_ptr",
 ]

@@ -932,9 +932,9 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
             expert_counts=states.expert_counts_host,
             echo_seq=states.seq,
         )
-        # ``reduced`` is float32 and the slot is the payload dtype; the copy
-        # inside write_slot casts on its way into the peer window, so the
-        # narrowing costs no extra pass over the rows.
+        # ``reduced`` is float32 and the slot is the payload dtype; write_slot
+        # narrows it to the payload dtype before the put, since a put moves
+        # raw bytes and does not cast the way a copy_ into a mapped view did.
         window.write_slot(
             peer=states.src_role_rank,
             region=self.role_rank,
@@ -1021,8 +1021,9 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
                 region=self.role_rank,
                 ring=0,
                 header=header,
+                expand_idx=None,
+                weights=None,
                 routed_x=None,
-                shared_idx=None,
                 shared_x=None,
             )
 

@@ -32,10 +32,12 @@ destination only ``(1 - 1/ffn_size) ** topk`` of the time, so at 2A2F and
 ``hidden_size`` elements, so shipping them whole to every peer costs well under
 a percent of the slot.
 
-Flag words are written *after* the payload on the same stream. Same-stream
-device-to-device copies complete in issue order, so a visible flag implies a
-complete payload. That holds for NVLink-mapped peer memory; a cross-node
-transport would need an explicit fence here.
+Every write is a one-sided NVSHMEM put, addressed by PE number rather than by
+a locally-mapped peer pointer, so it works whether the peer sits on this node
+or across the network. The flag put is ordered after the payload puts with an
+explicit ``nvshmem_rt.fence_on_stream`` so that a visible flag still implies a
+complete payload -- same-stream issue order alone only guaranteed that for
+same-engine device-to-device copies, which a network put is not.
 
 The receive side reads flags and headers on its own stream. What it reads was
 produced by a peer, never by anything this rank queued, so the read needs no
@@ -324,20 +326,16 @@ class SymmWindow:
 
         nvshmem_rt.init(group, rank, world_size)
         self._base = nvshmem_rt.malloc(self.total_bytes)
-        # Peer mappings are stable for the life of the allocation, so resolve
-        # them once instead of per transfer.
-        self._peer_base = {
-            pe: (self._base if pe == rank else nvshmem_rt.peer_ptr(self._base, pe))
-            for pe in range(world_size)
-        }
         self.local_bytes_view().zero_()
         torch.cuda.synchronize()
 
-        # The layout is static, so every window view is built once and then
+        # The layout is static, so every local view is built once and then
         # sliced. Rebuilding them per transfer meant a __cuda_array_interface__
         # import on every field of every message, which dominated the data path.
-        self._view_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
-        self._flag_cache: dict[tuple[int, int], torch.Tensor] = {}
+        # Only local (this rank's own) views are cached -- writes go out
+        # through nvshmem_rt.put_on_stream, addressed by PE number, so there is
+        # no per-peer view to build any more.
+        self._view_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         self._flags_local = nvshmem_rt.tensor_from_ptr(
             self._base,
             byte_offset=0,
@@ -355,6 +353,19 @@ class SymmWindow:
             (world_size, ring_depth, layout.header_words),
             dtype=torch.int32,
         ).pin_memory()
+        # A put's source must be device-resident, so a CPU-built header takes
+        # one more hop than the old raw-pointer write did: pinned host memory,
+        # then this small device buffer, then the put. One buffer reused
+        # across every send is safe only because every send in this connector
+        # is issued on one stream in order (see the module docstring):
+        # put_on_stream uses the blocking (non-nbi) put, whose source is safe
+        # to overwrite only once the put has completed, and stream order is
+        # what guarantees that here without an explicit event per send.
+        self._header_stage_device = torch.empty(
+            layout.header_words,
+            dtype=torch.int32,
+            device=device,
+        )
         self._header_recv = torch.zeros(
             layout.header_words,
             dtype=torch.int32,
@@ -385,13 +396,14 @@ class SymmWindow:
 
     def _capacity_view(
         self,
-        peer: int,
         region: int,
         ring: int,
         field_off: int,
     ) -> torch.Tensor:
-        """Return the cached full-capacity view of one slot field."""
-        key = (peer, region, ring, field_off)
+        """Return the cached full-capacity view of one slot field in this
+        rank's own window -- what a peer's put lands into, never a remote
+        address."""
+        key = (region, ring, field_off)
         view = self._view_cache.get(key)
         if view is not None:
             return view
@@ -410,7 +422,7 @@ class SymmWindow:
             raise ValueError(f"unknown slot field offset {field_off}")
 
         view = nvshmem_rt.tensor_from_ptr(
-            self._peer_base[peer],
+            self._base,
             byte_offset=self._slot_byte_off(region, ring) + field_off,
             sizes=sizes,
             dtype=dtype,
@@ -421,7 +433,6 @@ class SymmWindow:
 
     def _view(
         self,
-        peer: int,
         region: int,
         ring: int,
         field_off: int,
@@ -430,24 +441,12 @@ class SymmWindow:
     ) -> torch.Tensor:
         # Slicing a cached capacity view costs no CUDA calls, unlike importing
         # a fresh pointer for every field of every message.
-        return self._capacity_view(peer, region, ring, field_off)[: sizes[0]]
-
-    def _flag_view(self, peer: int, flag_idx: int) -> torch.Tensor:
-        key = (peer, flag_idx)
-        view = self._flag_cache.get(key)
-        if view is None:
-            view = nvshmem_rt.tensor_from_ptr(
-                self._peer_base[peer],
-                byte_offset=flag_idx * 4,
-                sizes=(1,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self._flag_cache[key] = view
-        return view
+        return self._capacity_view(region, ring, field_off)[: sizes[0]]
 
     # ------------------------------------------------------------------
-    # Send side: every write targets ``peer``'s window, one-sided.
+    # Send side: every write is a one-sided NVSHMEM put into ``peer``'s
+    # window, addressed by PE number rather than by a locally-mapped peer
+    # pointer -- see the module docstring.
     # ------------------------------------------------------------------
 
     def write_slot(
@@ -461,19 +460,15 @@ class SymmWindow:
         weights: torch.Tensor | None,
         routed_x: torch.Tensor | None,
         shared_x: torch.Tensor | None,
-        routed_rows: torch.Tensor | None = None,
-        shared_rows: torch.Tensor | None = None,
         flag_value: int | None = None,
     ) -> None:
         """Write one slot into ``peer``'s window, then stamp its flag.
 
-        The flag copy is issued last on the same stream, so a peer that observes
-        the flag also observes the payload.
-
-        ``routed_rows``/``shared_rows`` are row indices into ``routed_x`` /
-        ``shared_x``: the gather then lands directly in the peer's window.
-        Materializing the gathered rows locally first would write and re-read
-        every payload byte for nothing.
+        The flag put is ordered after the payload puts with an explicit
+        ``nvshmem_rt.fence_on_stream``, not just by being issued later on the
+        same stream: two independent puts to a peer are not guaranteed to
+        land in issue order the way two same-engine device-to-device copies
+        are (see the module docstring).
 
         ``flag_value`` overrides what the flag is stamped with, which defaults
         to this message's own sequence number. A reply stamps the sequence it
@@ -486,8 +481,8 @@ class SymmWindow:
         ``flag_value`` is then required.
         """
         layout = self.layout
-        routed_count = _row_count(routed_x, routed_rows)
-        shared_count = _row_count(shared_x, shared_rows)
+        routed_count = _row_count(routed_x, None)
+        shared_count = _row_count(shared_x, None)
         partial_count = _row_count(expand_idx, None)
         if routed_count > layout.token_cap:
             raise RuntimeError(
@@ -502,70 +497,51 @@ class SymmWindow:
                 f"shared tokens {shared_count} exceed token_cap {layout.token_cap}",
             )
 
-        header_view = self._capacity_view(peer, region, ring, layout.header_off)
+        stream = torch.cuda.current_stream(self.device).cuda_stream
+        slot_off = self._slot_byte_off(region, ring)
+
         if header.is_cuda:
-            header_view.copy_(header, non_blocking=True)
+            header_src = header
         else:
-            # Stage through pinned memory so the copy is asynchronous: a
-            # pageable source would force a blocking transfer, and there is one
-            # header per peer per layer.
+            # A put's source must be device-resident, so a CPU header takes
+            # one more hop than a peer-mapped copy_ did: pinned host memory
+            # (asynchronous H2D needs it), then the small device staging
+            # buffer from __init__, then the put.
             staging = self._header_send[peer][ring]
             staging.copy_(header)
-            header_view.copy_(staging, non_blocking=True)
+            self._header_stage_device.copy_(staging, non_blocking=True)
+            header_src = self._header_stage_device
+        nvshmem_rt.put_on_stream(
+            self._base + slot_off + layout.header_off,
+            header_src,
+            pe=peer,
+            stream=stream,
+        )
 
         def write_field(
-            field_off: int,
-            trailing_sizes: tuple[int, ...],
-            dtype: torch.dtype,
-            src: torch.Tensor | None,
-            count: int,
-            rows: torch.Tensor | None = None,
+            field_off: int, dtype: torch.dtype, src: torch.Tensor | None
         ) -> None:
-            if src is None or not count:
+            if src is None or not src.shape[0]:
                 return
-            view = self._view(
-                peer,
-                region,
-                ring,
-                field_off,
-                (count, *trailing_sizes),
-                dtype,
+            # A put copies raw bytes: no implicit dtype cast the way copy_
+            # into a mapped view used to give for free, so a mismatched dtype
+            # (the FFN reply's float32 accumulator into a bf16 slot) needs an
+            # explicit pass first.
+            if src.dtype != dtype:
+                src = src.to(dtype)
+            if not src.is_contiguous():
+                src = src.contiguous()
+            nvshmem_rt.put_on_stream(
+                self._base + slot_off + field_off,
+                src,
+                pe=peer,
+                stream=stream,
             )
-            if rows is None:
-                view.copy_(src, non_blocking=True)
-            else:
-                torch.index_select(src, 0, rows, out=view)
 
-        write_field(
-            layout.expand_idx_off,
-            (),
-            torch.int32,
-            expand_idx,
-            partial_count,
-        )
-        write_field(
-            layout.weights_off,
-            (),
-            torch.float32,
-            weights,
-            _row_count(weights, None),
-        )
-        write_field(
-            layout.routed_x_off,
-            (layout.hidden_size,),
-            self.payload_dtype,
-            routed_x,
-            routed_count,
-            routed_rows,
-        )
-        write_field(
-            layout.shared_x_off,
-            (layout.hidden_size,),
-            self.payload_dtype,
-            shared_x,
-            shared_count,
-            shared_rows,
-        )
+        write_field(layout.expand_idx_off, torch.int32, expand_idx)
+        write_field(layout.weights_off, torch.float32, weights)
+        write_field(layout.routed_x_off, self.payload_dtype, routed_x)
+        write_field(layout.shared_x_off, self.payload_dtype, shared_x)
 
         if flag_value is None:
             if header.is_cuda:
@@ -574,9 +550,14 @@ class SymmWindow:
                     "reading its sequence number back would synchronize",
                 )
             flag_value = int(header[_H_SEQ].item())
-        seq = flag_value
         flag_idx = region * self.ring_depth + ring
-        self._flag_view(peer, flag_idx).fill_(seq)
+        nvshmem_rt.fence_on_stream(stream)
+        nvshmem_rt.put_scalar_i32_on_stream(
+            self._base + flag_idx * 4,
+            flag_value,
+            pe=peer,
+            stream=stream,
+        )
 
     # ------------------------------------------------------------------
     # Receive side.
@@ -652,7 +633,7 @@ class SymmWindow:
         # flag is read there.
         with torch.cuda.stream(self._poll_stream):
             self._header_recv.copy_(
-                self._capacity_view(self.rank, region, ring, self.layout.header_off),
+                self._capacity_view(region, ring, self.layout.header_off),
             )
         return decode_header(self._header_recv)
 
@@ -664,12 +645,7 @@ class SymmWindow:
         tensor from the decoded host list would cost one blocking H2D per work
         item.
         """
-        header = self._capacity_view(
-            self.rank,
-            region,
-            ring,
-            self.layout.header_off,
-        )
+        header = self._capacity_view(region, ring, self.layout.header_off)
         return header[HEADER_FIXED_WORDS:]
 
     def local_expand_idx(
@@ -685,7 +661,6 @@ class SymmWindow:
         the ``segment_start`` its header carries.
         """
         return self._view(
-            self.rank,
             region,
             ring,
             self.layout.expand_idx_off,
@@ -701,7 +676,6 @@ class SymmWindow:
         start: int = 0,
     ) -> torch.Tensor:
         return self._view(
-            self.rank,
             region,
             ring,
             self.layout.weights_off,
@@ -711,7 +685,6 @@ class SymmWindow:
 
     def local_routed(self, region: int, ring: int, count: int) -> torch.Tensor:
         return self._view(
-            self.rank,
             region,
             ring,
             self.layout.routed_x_off,
@@ -721,7 +694,6 @@ class SymmWindow:
 
     def local_shared(self, region: int, ring: int, count: int) -> torch.Tensor:
         return self._view(
-            self.rank,
             region,
             ring,
             self.layout.shared_x_off,
@@ -733,4 +705,4 @@ class SymmWindow:
         # ponytail: the symmetric allocation is left to process teardown.
         # nvshmem_free is collective, so freeing here would need both roles to
         # shut down in lockstep; add it if windows are ever recreated in-process.
-        self._peer_base = {}
+        self._view_cache = {}
