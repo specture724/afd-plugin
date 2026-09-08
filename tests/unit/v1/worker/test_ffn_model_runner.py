@@ -7,6 +7,7 @@ import logging
 import threading
 from collections import deque
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -37,7 +38,7 @@ from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker  # noqa: E402
 
 class _FakeConnector:
     def __init__(self):
-        self.attn_outputs = deque()
+        self.attn_outputs: deque = deque()
         self.ffn_outputs = []
         self.expert_routing_specs = []
         self.recv_input_ids = []
@@ -86,7 +87,7 @@ class _FakeConnector:
 class _ConnectorDrivenFakeConnector(_FakeConnector):
     def __init__(self):
         super().__init__()
-        self.control_plane = None
+        self.control_plane: Any = None
 
 
 class _FakeModel:
@@ -240,7 +241,9 @@ def test_ffn_runner_forwards_payload_input_ids_to_model():
         def __init__(self):
             self.calls = []
 
-        def compute_ffn_output(self, hidden_states, layer_idx, *, input_ids):
+        def compute_ffn_output(  # type: ignore[override]
+            self, hidden_states, layer_idx, *, input_ids
+        ):
             self.calls.append((hidden_states, layer_idx, input_ids))
             return input_ids
 

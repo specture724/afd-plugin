@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 import sys
@@ -412,20 +415,25 @@ def test_deepseek_compute_gate_on_attention_selects_backend_boundary():
     assert "self.mlp = AFDDeepseekV2RemoteExpertsMoE(" in source
     assert "self.mlp = GateOnlyRemoteMoE(" in source
     assert 'prefix=f"{prefix}.mlp"' in source
+    # The gate/topk helper delegates expert selection to the connector, so both
+    # platforms share it; only the FFN-side MoE compute stays platform-split.
     assert (
-        "# NPU-only: Attention-side gate/topk is implemented in the NPU helper."
+        "# The gate helper delegates expert selection to the connector, so both"
         in source
     )
     assert (
         "# NPU-only: gated MoE FFN compute consumes Attention-side topk payloads."
         in source
     )
+    # CUDA reaches its own grouped-GEMM entry point only once tokens arrive
+    # pre-routed; without a group list the control-plane path still applies.
+    assert "gpu_attention_gate.compute_attention_gate_moe_ffn(" in source
 
 
 def test_async_moe_pipeline_preserves_stage_order(monkeypatch):
     from afd_plugin.model_executor.models.npu import deepseek_v2_async_cam_forward
 
-    events = []
+    events: list[tuple] = []
     forward_context = SimpleNamespace(
         attn_metadata={"layer": "full"},
         additional_kwargs={},
@@ -653,18 +661,18 @@ def test_deepseek_afd_ffn_skips_empty_rank_local_moe_work(
         )
 
     fake_moe_mlp = ModuleType("vllm_ascend.ops.fused_moe.moe_mlp")
-    fake_moe_mlp.unified_apply_mlp = fake_unified_apply_mlp
+    fake_moe_mlp.unified_apply_mlp = fake_unified_apply_mlp  # type: ignore[attr-defined]
     fake_stage_contracts = ModuleType(
         "vllm_ascend.ops.fused_moe.moe_stage_contracts",
     )
-    fake_stage_contracts.MoEMlpComputeInput = KeywordArguments
-    fake_stage_contracts.MoEWeights = KeywordArguments
+    fake_stage_contracts.MoEMlpComputeInput = KeywordArguments  # type: ignore[attr-defined]
+    fake_stage_contracts.MoEWeights = KeywordArguments  # type: ignore[attr-defined]
     fake_stage_params = ModuleType(
         "vllm_ascend.ops.fused_moe.moe_stage_params",
     )
-    fake_stage_params.MoEQuantParams = KeywordArguments
+    fake_stage_params.MoEQuantParams = KeywordArguments  # type: ignore[attr-defined]
     fake_quant_type = ModuleType("vllm_ascend.quantization.quant_type")
-    fake_quant_type.QuantType = FakeQuantType
+    fake_quant_type.QuantType = FakeQuantType  # type: ignore[attr-defined]
     monkeypatch.setitem(
         sys.modules,
         "vllm_ascend.ops.fused_moe.moe_mlp",

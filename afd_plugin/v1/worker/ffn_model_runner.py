@@ -97,17 +97,25 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                 role="ffn",
             )
 
-        self.model: Any | None = None
+        self.model: Any = None
         self.model_memory_usage = 0
         self.num_layers = int(self.model_config.hf_text_config.num_hidden_layers)
-        self.use_cuda_graph = (
-            False
-            if self.is_connector_driven
-            else bool(self.afd_cudagraph_policy.enable_ffn_graph_cache)
+        self.use_cuda_graph = bool(
+            self.afd_cudagraph_policy is not None
+            and self.afd_cudagraph_policy.enable_ffn_graph_cache
         )
         self._cuda_graphs: dict[tuple, dict[str, Any]] = {}
         self._graph_memory_pool: Any | None = None
         self.prof = create_afd_gpu_profiler("ffn")
+
+    @property
+    def _control_plane(self) -> Any:
+        """The control plane, on the paths that only run when there is one."""
+        control_plane = self.connector.control_plane
+        assert control_plane is not None, (
+            "control-plane FFN path reached on a connector-driven runner",
+        )
+        return control_plane
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
@@ -168,6 +176,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             graph_exists=cuda_graph_info is not None,
         )
         if run_mode is AFDGraphRunMode.REPLAY:
+            assert cuda_graph_info is not None
             cuda_graph_info["graph"].replay()
             return None
 
@@ -187,7 +196,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         update_connector_state: bool = True,
     ) -> torch.Tensor | None:
         if update_connector_state:
-            self.connector.control_plane.update_state_from_dp_metadata(
+            self._control_plane.update_state_from_dp_metadata(
                 _make_dp_metadata_payload(
                     dp_metadata_list,
                     is_graph_capturing=is_graph_capturing,
@@ -295,7 +304,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         with _ffn_forward_context(self.vllm_config) as forward_context:
             for _ in range(max_items):
                 try:
-                    work_item = connector.recv_ffn_work_item(
+                    work_item = connector.recv_ffn_work_item(  # type: ignore[attr-defined]
                         stage_idx=stage_idx,
                         max_num_tokens=self.vllm_config.scheduler_config.max_num_batched_tokens,
                     )
@@ -317,7 +326,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                 _set_moe_layer_index(forward_context, work_item.layer_idx)
 
                 rank_ffn_output = self._compute_work_item(work_item, states)
-                rank_ffn_output = connector.send_ffn_work_item_output(
+                rank_ffn_output = connector.send_ffn_work_item_output(  # type: ignore[attr-defined]
                     work_item,
                     rank_ffn_output,
                 )
@@ -384,7 +393,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             cudagraph = torch.cuda.CUDAGraph()
             # DP metadata receive/update is a control-plane side effect and must
             # complete before CUDA graph capture starts.
-            self.connector.control_plane.update_state_from_dp_metadata(
+            self._control_plane.update_state_from_dp_metadata(
                 _make_dp_metadata_payload(
                     dp_metadata_list,
                     is_graph_capturing=is_attn_graph_capturing,
@@ -426,7 +435,7 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         try:
             with graph_capture(device=self.device):
                 if is_warmup:
-                    self.connector.control_plane.update_state_from_dp_metadata(
+                    self._control_plane.update_state_from_dp_metadata(
                         _make_dp_metadata_payload(
                             dp_metadata_list,
                             is_graph_capturing=False,
@@ -513,7 +522,7 @@ def _ffn_forward_context(vllm_config: VllmConfig):
         yield get_forward_context()
 
 
-def _set_moe_layer_index(forward_context: object, layer_idx: int) -> None:
+def _set_moe_layer_index(forward_context: Any, layer_idx: int) -> None:
     all_moe_layers = forward_context.all_moe_layers
     if not all_moe_layers:
         return

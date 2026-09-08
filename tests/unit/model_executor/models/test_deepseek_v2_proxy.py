@@ -1,14 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-nn = torch.nn
+if TYPE_CHECKING:
+    from torch import nn
+else:
+    nn = torch.nn
 
-from afd_plugin.config import AFD_ASYNC_CONNECTOR, AFDConfig  # noqa: E402
+from afd_plugin.config import AFD_ASYNC_NPU_CONNECTOR, AFDConfig  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 
 
@@ -63,7 +70,7 @@ def test_native_decoder_forward_calls_remote_proxy_once(
     monkeypatch,
     layer_idx,
 ):
-    events = []
+    events: list[Any] = []
     afd_metadata = _install_fake_forward_context(monkeypatch, events)
     monkeypatch.setattr(adapter.native, "DeepseekAttention", _FakeAttention)
 
@@ -130,7 +137,7 @@ def test_ffn_compute_applies_dense_fp16_scaling_once(
 def test_gate_proxy_sends_routing_payload(monkeypatch):
     from afd_plugin.model_executor.models.npu import deepseek_v2_attention_gate
 
-    events = []
+    events: list[Any] = []
     _install_fake_forward_context(monkeypatch, events, stage_idx=1)
     topk_weights = torch.tensor([[0.75, 0.25]])
     topk_ids = torch.tensor([[1, 3]])
@@ -167,7 +174,7 @@ def test_gate_proxy_sends_routing_payload(monkeypatch):
 
 
 def test_remote_experts_proxy_sends_router_logits(monkeypatch):
-    events = []
+    events: list[Any] = []
     _install_fake_forward_context(monkeypatch, events, stage_idx=1)
     proxy = adapter.AFDAttentionFusedMoE(
         layer_idx=3,
@@ -247,7 +254,7 @@ def test_async_connector_dispatches_to_schedule_adapter(monkeypatch):
     nn.Module.__init__(model)
     model.afd_config = AFDConfig(
         role="attention",
-        connector=AFD_ASYNC_CONNECTOR,
+        connector=AFD_ASYNC_NPU_CONNECTOR,
     )
     positions = torch.arange(1)
 

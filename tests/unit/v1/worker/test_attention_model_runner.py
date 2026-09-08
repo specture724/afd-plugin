@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -404,10 +405,10 @@ def test_ubatch_missing_metadata_uses_complete_public_installer():
 
     wrapper._install_missing_afd_metadata(forward_context)
 
-    metadata = forward_context.additional_kwargs["afd_metadata"]
-    assert metadata is runner._afd_pending_metadata
+    metadata: Any = forward_context.additional_kwargs["afd_metadata"]
     assert metadata.transaction_id == "afd-0"
     assert metadata.tokens_lens == [3, 5]
+    assert metadata is runner._afd_pending_metadata
     assert set(runner.connector.sent_dp_metadata_lists[0]) == {0, 1}
 
 
@@ -1133,7 +1134,7 @@ def _fake_connector_factory(monkeypatch, connector):
 def test_attention_runner_constructor_does_not_initialize_connector(monkeypatch):
     import afd_plugin.v1.worker.attention_model_runner as attention_model_runner
 
-    events = []
+    events: list[str] = []
     connector = _LifecycleConnector(events)
 
     def fake_native_init(self, vllm_config, device):
@@ -1177,7 +1178,7 @@ def test_attention_runner_load_model_initializes_connector_after_weights(
     monkeypatch,
     use_ubatching,
 ):
-    events = []
+    events: list[str] = []
     connector = _LifecycleConnector(events)
     runner = object.__new__(AFDAttentionModelRunner)
     runner.connector = connector

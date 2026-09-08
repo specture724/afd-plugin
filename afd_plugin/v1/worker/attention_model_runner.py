@@ -100,6 +100,10 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
 
     afd_expected_role = "attention"
 
+    #: Declared, not assigned: the wrapper install both reads and rebinds it,
+    #: which leaves its type unresolvable from the base class alone.
+    model: Any
+
     # Class-level defaults so a runner built without ``__init__`` -- which is how
     # the unit tests exercise the metadata plumbing -- still reads as "no async
     # ubatching" instead of raising on a missing attribute.
@@ -177,22 +181,18 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             self.connector.init_afd_connector()
 
     def _install_afd_ubatch_wrapper(self) -> None:
-        if isinstance(self.model, AFDUBatchWrapper):
-            self.model.configure_afd_context_provider(
-                self.install_afd_metadata_on_forward_context,
+        model: Any = self.model
+        if not isinstance(model, AFDUBatchWrapper):
+            if isinstance(model, UBatchWrapper):
+                model = model.unwrap()
+            model = AFDUBatchWrapper(
+                model,
+                self.vllm_config,
+                CUDAGraphMode.NONE,
+                self.device,
             )
-            return
-
-        model = self.model
-        if isinstance(model, UBatchWrapper):
-            model = model.unwrap()
-        self.model = AFDUBatchWrapper(
-            model,
-            self.vllm_config,
-            CUDAGraphMode.NONE,
-            self.device,
-        )
-        self.model.configure_afd_context_provider(
+            self.model = model
+        model.configure_afd_context_provider(
             self.install_afd_metadata_on_forward_context,
         )
 
