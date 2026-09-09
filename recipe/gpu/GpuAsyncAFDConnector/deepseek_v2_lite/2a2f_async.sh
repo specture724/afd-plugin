@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
+# 2A2F async GPU connector, prefill-only. ATTN_EAGER picks the Attention
+# side's run mode; the FFN side always runs its padded expert graphs unless
+# FFN_EAGER=1.
+#
+# Launch under a GPU reservation, which sets CUDA_VISIBLE_DEVICES:
+#   gpu run --gpus 4 -- bash recipe/gpu/GpuAsyncAFDConnector/deepseek_v2_lite/2a2f_async.sh
+#
+# The two roles are separate vllm serve processes: the AFD process group hosts
+# its own TCPStore, which cannot be created under a single torchrun/torchelastic
+# launcher.
+set -u
+
+MODEL_PATH=${MODEL_PATH:-/path/model_weights/DeepSeek-V2-Lite}
+# How to invoke vLLM. `uv run vllm` is right from a synced checkout; override
+# to point at an interpreter that actually has the plugin installed.
+VLLM_CMD=${VLLM_CMD:-uv run vllm}
+# Set to 1 to run the FFN experts eagerly instead of from its padded graphs.
+FFN_EAGER=${FFN_EAGER:-0}
+FFN_EAGER_ARG=""
+[ "$FFN_EAGER" = 1 ] && FFN_EAGER_ARG="--enforce-eager"
+# Attention-side run mode, same meaning as in 1a1f_graph_async.sh:
+#   1 -- eager (the long-standing default)
+#   0 -- FULL_DECODE_ONLY graphs; prefill steps still run eager
+#   2 -- FULL_DECODE_ONLY graphs plus the prefill token buckets
+ATTN_EAGER=${ATTN_EAGER:-1}
+PREFILL_BUCKETS=${PREFILL_BUCKETS:-}
+# Set to 1 for vLLM's dual batch overlap. The flags go to BOTH roles: each
+# side sizes its window rings from the visible stage count, and a count only
+# one role sees leaves the FFN with fewer rings than the Attention dispatches
+# into -- the second stage lands where nobody polls and the first forward
+# waits forever (see 1a1f_graph_async.sh for the full story).
+ENABLE_DBO=${ENABLE_DBO:-0}
+DBO_ARGS=""
+if [ "$ENABLE_DBO" = 1 ]; then
+    DBO_ARGS="--enable-dbo --dbo-decode-token-threshold ${DBO_DECODE_THRESHOLD:-2} --dbo-prefill-token-threshold ${DBO_PREFILL_THRESHOLD:-12}"
+fi
+LOG_DIR=${LOG_DIR:-.}
+mkdir -p "$LOG_DIR"
+export VLLM_USE_V2_MODEL_RUNNER=0
+# Single node over NVLink: skip the IB transport probe.
+export NVSHMEM_REMOTE_TRANSPORT=${NVSHMEM_REMOTE_TRANSPORT:-none}
+# Two servers on one box spawn a lot of threads; the HF tokenizer's rayon pool
+# is the first thing to fail when thread creation gets refused.
+export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
+export RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-2}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+
+# Split the reserved devices in half: first two Attention, last two FFN.
+IFS=',' read -r -a DEVICES <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+if [ "${#DEVICES[@]}" -lt 4 ]; then
+    echo "need 4 visible GPUs, got ${#DEVICES[@]}: ${CUDA_VISIBLE_DEVICES:-unset}" >&2
+    exit 1
+fi
+ATTN_DEVICES="${DEVICES[0]},${DEVICES[1]}"
+FFN_DEVICES="${DEVICES[2]},${DEVICES[3]}"
+echo "attention on ${ATTN_DEVICES}, ffn on ${FFN_DEVICES}"
+
+# Lower this when sharing a box: vLLM refuses to start if the desired
+# fraction exceeds what is actually free.
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.9}
+# Prefill batch size drives whether each MoE call clears the compute-bound
+# inflection point, so it is the knob to raise when benchmarking.
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-512}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
+# Cap the context window; a 1M-token native default would size KV against it.
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-}
+MAX_MODEL_LEN_ARG=""
+[ -n "$MAX_MODEL_LEN" ] && MAX_MODEL_LEN_ARG="--max-model-len $MAX_MODEL_LEN"
+TOKENIZER_MODE=${TOKENIZER_MODE:-}
+TOKENIZER_MODE_ARG=""
+[ -n "$TOKENIZER_MODE" ] && TOKENIZER_MODE_ARG="--tokenizer-mode $TOKENIZER_MODE"
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
+KV_CACHE_DTYPE_ARG=""
+[ -n "$KV_CACHE_DTYPE" ] && KV_CACHE_DTYPE_ARG="--kv-cache-dtype $KV_CACHE_DTYPE"
+# Free-form passthrough, e.g. EXTRA_ARGS="--no-enable-prefix-caching".
+EXTRA_ARGS=${EXTRA_ARGS:-}
+AFD_PORT=${AFD_PORT:-6271}
+API_PORT=${API_PORT:-18307}
+# The FFN server never takes HTTP -- its EngineCore is a connector daemon --
+# but it still starts an API server, and both roles racing for one port means
+# whichever loses exits and takes its role down with it. Give it its own.
+FFN_API_PORT=${FFN_API_PORT:-$((API_PORT + 1))}
+
+# One capture bucket per decode size 1..MAX_NUM_SEQS. A single bucket at the
+# max would pad every decode batch up to it, and the empty-last-ubatch guard
+# then refuses to split any batch below half the bucket -- DBO would silently
+# never split under graphs. ATTN_EAGER=2 adds the prefill buckets on top, as
+# capture sizes so the dispatcher's padding lands on a captured graph. The
+# plugin reads PREFILL_BUCKETS from the environment, and it is an
+# Attention-side strategy only -- the FFN role refuses to start when it sees
+# the variable -- so it goes on that one command, never on the shared export.
+ATTN_GRAPH_ARGS="--enforce-eager"
+ATTN_BUCKET_ENV=()
+if [ "$ATTN_EAGER" != 1 ]; then
+    BUCKET_LIST=""
+    MAX_CAPTURE="$MAX_NUM_SEQS"
+    if [ "$ATTN_EAGER" = 2 ]; then
+        PREFILL_BUCKETS=${PREFILL_BUCKETS:-$MAX_NUM_BATCHED_TOKENS}
+        ATTN_BUCKET_ENV=(env "PREFILL_BUCKETS=$PREFILL_BUCKETS")
+        BUCKET_LIST=$(echo "$PREFILL_BUCKETS" | tr ',' ' ')
+        for size in $BUCKET_LIST; do
+            [ "$size" -gt "$MAX_CAPTURE" ] && MAX_CAPTURE=$size
+        done
+    fi
+    CAPTURE_SIZES="$(seq -s' ' 1 "$MAX_NUM_SEQS") ${BUCKET_LIST}"
+    ATTN_GRAPH_ARGS="--max-cudagraph-capture-size ${MAX_CAPTURE} --cudagraph-capture-sizes ${CAPTURE_SIZES} --compilation-config {\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}"
+fi
+
+CUDA_VISIBLE_DEVICES="$ATTN_DEVICES" "${ATTN_BUCKET_ENV[@]}" $VLLM_CMD serve "$MODEL_PATH" \
+    --data-parallel-size 2 \
+    --tensor-parallel-size 1 \
+    --enable-expert-parallel \
+    --additional-config '{
+        "afd": {
+            "role": "attention",
+            "connector": "GpuAsyncAFDConnector",
+            "async": true,
+            "compute_gate_on_attention": true,
+            "host": "127.0.0.1",
+            "port": '"$AFD_PORT"',
+            "num_attention_ranks": 2,
+            "num_ffn_ranks": 2
+        }
+    }' \
+    --max-num-seqs "$MAX_NUM_SEQS" \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+    $MAX_MODEL_LEN_ARG \
+    $TOKENIZER_MODE_ARG \
+    $KV_CACHE_DTYPE_ARG \
+    --api-server-count 1 \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    $ATTN_GRAPH_ARGS \
+    $DBO_ARGS \
+    $EXTRA_ARGS \
+    --host 127.0.0.1 \
+    --port "$API_PORT" \
+    --trust-remote-code > "$LOG_DIR/attn.log" 2>&1 &
+ATTN_PID=$!
+
+CUDA_VISIBLE_DEVICES="$FFN_DEVICES" $VLLM_CMD serve "$MODEL_PATH" \
+    --data-parallel-size 2 \
+    --tensor-parallel-size 1 \
+    --enable-expert-parallel \
+    --additional-config '{
+        "afd": {
+            "role": "ffn",
+            "connector": "GpuAsyncAFDConnector",
+            "async": true,
+            "compute_gate_on_attention": true,
+            "host": "127.0.0.1",
+            "port": '"$AFD_PORT"',
+            "num_attention_ranks": 2,
+            "num_ffn_ranks": 2
+        }
+    }' \
+    --max-num-seqs "$MAX_NUM_SEQS" \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+    $MAX_MODEL_LEN_ARG \
+    $TOKENIZER_MODE_ARG \
+    $KV_CACHE_DTYPE_ARG \
+    --api-server-count 1 \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    $FFN_EAGER_ARG \
+    $DBO_ARGS \
+    $EXTRA_ARGS \
+    --host 127.0.0.1 \
+    --port "$FFN_API_PORT" \
+    --trust-remote-code > "$LOG_DIR/ffn.log" 2>&1 &
+FFN_PID=$!
+
+cleanup() {
+    kill "$ATTN_PID" "$FFN_PID" 2>/dev/null
+    wait "$ATTN_PID" "$FFN_PID" 2>/dev/null
+}
+trap cleanup EXIT
+
+for _ in $(seq 1 "${READY_TIMEOUT:-600}"); do
+    if curl -sf "http://127.0.0.1:$API_PORT/health" > /dev/null 2>&1; then
+        echo "server ready on http://127.0.0.1:$API_PORT"
+        echo
+        echo "curl -s http://127.0.0.1:$API_PORT/v1/completions \\"
+        echo "  -H 'Content-Type: application/json' \\"
+        echo "  -d '{\"model\":\"$MODEL_PATH\",\"prompt\":\"The capital of France is\",\"max_tokens\":16,\"temperature\":0}'"
+        echo
+        if [ -n "${SMOKE:-}" ]; then
+            curl -s "http://127.0.0.1:$API_PORT/v1/completions" \
+                -H 'Content-Type: application/json' \
+                -d '{"model":"'"$MODEL_PATH"'","prompt":"The capital of France is",
+                     "max_tokens":16,"temperature":0,
+                     "skip_special_tokens":false,"logprobs":2}'
+            echo
+            exit 0
+        fi
+        # Stay up so the servers can take requests; Ctrl-C tears both down.
+        wait "$ATTN_PID" "$FFN_PID"
+        exit 0
+    fi
+    if ! kill -0 "$ATTN_PID" 2>/dev/null || ! kill -0 "$FFN_PID" 2>/dev/null; then
+        echo "a server exited early; see $LOG_DIR/attn.log and $LOG_DIR/ffn.log" >&2
+        exit 1
+    fi
+    sleep 1
+done
+echo "timed out waiting for the server" >&2
+exit 1
