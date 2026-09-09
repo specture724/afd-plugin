@@ -34,6 +34,28 @@ FFN_GRAPH_ARGS=()
 #   2 -- FULL_DECODE_ONLY graphs plus the prefill token buckets
 ATTN_EAGER=${ATTN_EAGER:-1}
 PREFILL_BUCKETS=${PREFILL_BUCKETS:-}
+# Set to 1 for vLLM's dual batch overlap. The flags go to BOTH roles: each
+# side sizes its window rings from the visible stage count, and a count only
+# one role sees leaves the FFN with fewer rings than the Attention dispatches
+# into -- the second stage lands where nobody polls and the first forward
+# waits forever.
+#
+# DBO's sign on V4 is set by rows-per-expert per ubatch: splitting halves them
+# on an already-skinny grouped GEMM, and the only thing the overlap hides is
+# attention. Measured pure prefill on 4x L20X: -7.1% at 2048-token steps,
+# -3.7% at 4096, +0.5% at 8192 with 4096-token prompts. Raise
+# MAX_NUM_BATCHED_TOKENS with prompts at half of it before expecting a win --
+# and note that at one request per step the request-aligned splitter declines
+# to split at all, making DBO a no-op.
+ENABLE_DBO=${ENABLE_DBO:-0}
+DBO_ARGS=()
+if [ "$ENABLE_DBO" = 1 ]; then
+    DBO_ARGS=(
+        --enable-dbo
+        --dbo-decode-token-threshold "${DBO_DECODE_THRESHOLD:-2}"
+        --dbo-prefill-token-threshold "${DBO_PREFILL_THRESHOLD:-12}"
+    )
+fi
 LOG_DIR=${LOG_DIR:-.}
 mkdir -p "$LOG_DIR"
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -136,6 +158,7 @@ CUDA_VISIBLE_DEVICES="$ATTN_DEVICES" "${ATTN_BUCKET_ENV[@]}" "${VLLM_CMD[@]}" se
     --api-server-count 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     "${ATTN_GRAPH_ARGS[@]}" \
+    "${DBO_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     --host 127.0.0.1 \
     --port "$API_PORT" \
@@ -155,6 +178,7 @@ CUDA_VISIBLE_DEVICES="$FFN_DEVICES" "${VLLM_CMD[@]}" serve "$MODEL_PATH" \
     --api-server-count 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     "${FFN_GRAPH_ARGS[@]}" \
+    "${DBO_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     --host 127.0.0.1 \
     --port "$FFN_API_PORT" \
