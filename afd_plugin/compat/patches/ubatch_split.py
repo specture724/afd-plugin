@@ -12,6 +12,8 @@ request must run whole instead of being divided.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
@@ -19,6 +21,16 @@ from vllm.v1.worker.ubatch_utils import (
 )
 
 _DBO_UBATCH_COUNT = 2
+
+# Experiment switch: split a bucket-padded prefill step at a fixed point rather
+# than at a request boundary. A captured cooperative graph bakes each ubatch's
+# per-token buffer lengths in, and a request-aligned split lands wherever the
+# requests happen to end -- measured refusing 94% of split steps on
+# `slot_mapping_shape` alone. Splitting at half the bucket is the only split
+# whose shapes match what capture recorded. It cuts a request across the two
+# ubatches, which is what this splitter otherwise exists to avoid, so it is off
+# unless the replay path is being exercised.
+_FIXED_SPLIT = bool(os.environ.get("AFD_UBATCH_FIXED_SPLIT"))
 
 # A ubatch's per-token tensors (positions, slot_mapping) are views into the
 # step's buffers starting at the split point, so the split point decides their
@@ -57,6 +69,32 @@ def request_aligned_split_token(num_scheduled_tokens: np.ndarray) -> int | None:
     return int(candidates[nearest])
 
 
+def _fixed_bucket_split_token(
+    num_scheduled_tokens: np.ndarray,
+    num_tokens_padded: int,
+) -> int | None:
+    """Half the bucket, when this step is padded onto a captured prefill bucket.
+
+    Returns ``None`` whenever the fixed split does not apply or would be
+    unsafe: the experiment is off, the padded size is not a bucket, or the
+    real tokens do not reach the split point -- which would put the second
+    ubatch's first request before its own token slice and trip vLLM's
+    "token slice start outside of first request".
+    """
+    if not _FIXED_SPLIT:
+        return None
+    from afd_plugin.v1.worker.prefill_buckets import resolve_prefill_buckets
+
+    buckets = resolve_prefill_buckets()
+    if not buckets or int(num_tokens_padded) not in buckets:
+        return None
+    split = int(num_tokens_padded) // 2
+    real_tokens = int(np.sum(np.asarray(num_scheduled_tokens, dtype=np.int64)))
+    if split <= 0 or split >= real_tokens:
+        return None
+    return split
+
+
 # Patch reason: upstream maybe_create_ubatch_slices splits at an even token
 # count, cutting the straddling request into both ubatches. AFD overlaps whole
 # requests, so the split must fall on a request boundary, and a batch with no
@@ -79,6 +117,11 @@ def maybe_create_ubatch_slices(
         return None, None
 
     # ### PATCH START: request-aligned ubatch split
+    if split_point is None and num_ubatches == _DBO_UBATCH_COUNT:
+        split_point = _fixed_bucket_split_token(
+            num_scheduled_tokens,
+            num_tokens_padded,
+        )
     if split_point is None and num_ubatches == _DBO_UBATCH_COUNT:
         aligned = request_aligned_split_token(num_scheduled_tokens)
         if aligned is None:

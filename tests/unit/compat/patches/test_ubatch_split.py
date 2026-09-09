@@ -146,3 +146,64 @@ def test_patch_installed_on_vllm_modules() -> None:
     assert ubatch_utils.maybe_create_ubatch_slices is (
         ubatch_split.maybe_create_ubatch_slices
     )
+
+
+def test_fixed_bucket_split_needs_the_flag(monkeypatch):
+    # Off by default: a bucket-padded step still splits at a request boundary.
+    slices, _ = maybe_create_ubatch_slices(
+        True,
+        np.array([320, 192]),
+        num_tokens_padded=512,
+        num_reqs_padded=2,
+        num_ubatches=2,
+    )
+    assert slices is not None
+    assert slices[0].token_slice == slice(0, 320)
+
+
+def test_fixed_bucket_split_halves_the_bucket(monkeypatch):
+    monkeypatch.setattr(ubatch_split, "_FIXED_SPLIT", True)
+    monkeypatch.setenv("PREFILL_BUCKETS", "512")
+    slices, _ = maybe_create_ubatch_slices(
+        True,
+        np.array([320, 192]),
+        num_tokens_padded=512,
+        num_reqs_padded=2,
+        num_ubatches=2,
+    )
+    # Half the bucket, cutting the first request -- which is the point: only
+    # this split reproduces the shapes the graph was captured with.
+    assert slices is not None
+    assert slices[0].token_slice == slice(0, 256)
+    assert slices[1].token_slice == slice(256, 512)
+
+
+def test_fixed_bucket_split_declines_when_real_tokens_stop_short(monkeypatch):
+    # Padding, not real tokens, reaches the split point; splitting there puts
+    # the second ubatch's first request before its own token slice.
+    monkeypatch.setattr(ubatch_split, "_FIXED_SPLIT", True)
+    monkeypatch.setenv("PREFILL_BUCKETS", "512")
+    slices, _ = maybe_create_ubatch_slices(
+        True,
+        np.array([100, 60]),
+        num_tokens_padded=512,
+        num_reqs_padded=2,
+        num_ubatches=2,
+    )
+    assert slices is not None
+    # Fell back to the request boundary at 100, not the bucket's 256.
+    assert slices[0].token_slice == slice(0, 100)
+
+
+def test_fixed_bucket_split_ignores_a_non_bucket_padding(monkeypatch):
+    monkeypatch.setattr(ubatch_split, "_FIXED_SPLIT", True)
+    monkeypatch.setenv("PREFILL_BUCKETS", "512")
+    slices, _ = maybe_create_ubatch_slices(
+        True,
+        np.array([320, 192]),
+        num_tokens_padded=640,
+        num_reqs_padded=2,
+        num_ubatches=2,
+    )
+    assert slices is not None
+    assert slices[0].token_slice == slice(0, 320)
