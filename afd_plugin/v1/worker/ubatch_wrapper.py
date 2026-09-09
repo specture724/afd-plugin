@@ -42,8 +42,9 @@ _UBATCH_GRAPH_DEBUG = bool(os.environ.get("AFD_UBATCH_GRAPH_DEBUG"))
 _UBATCH_REPLAY_COPY = bool(os.environ.get("AFD_UBATCH_REPLAY_COPY"))
 
 # How often to report the replay share. Frequent enough to see it in a short
-# benchmark, rare enough not to write a line per step.
-_REPLAY_LOG_EVERY = 200
+# benchmark, rare enough not to write a line per step. A short probe run can
+# finish under this many steps and report nothing at all, so it is overridable.
+_REPLAY_LOG_EVERY = max(1, int(os.environ.get("AFD_UBATCH_LOG_EVERY", "200")))
 
 logger = init_logger(f"vllm.{__name__}")
 
