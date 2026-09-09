@@ -4,6 +4,9 @@
 
 # 2A2F DeepSeek-V4-Flash on the async GPU connector.
 #
+# ATTN_EAGER and FFN_EAGER pick each side's run mode; both default to eager,
+# which is what measured fastest on this model -- see the note on FFN_EAGER.
+#
 # Launch under a GPU reservation, which sets CUDA_VISIBLE_DEVICES:
 #   gpu run --gpus 4 -- \
 #     bash recipe/gpu/GpuAsyncAFDConnector/deepseek_v4_flash/2a2f_async.sh
@@ -17,6 +20,20 @@ MODEL_PATH=${MODEL_PATH:-/path/model_weights/deepseek-v4-flash}
 # How to invoke vLLM. `uv run vllm` is right from a synced checkout; override
 # to point at an interpreter that actually has the plugin installed.
 read -r -a VLLM_CMD <<< "${VLLM_CMD:-uv run vllm}"
+# The FFN experts run eagerly by default. Their padded graphs hold ~19 GiB
+# and buy nothing on V4: the FFN is compute-bound, so the per-item launch
+# saving is negligible, while a replay costs its whole captured bucket.
+# Measured pure prefill, 2A2F on 4x L20X, 128x1024 tokens: 17.9 s eager
+# against 19.0 s replaying every item. Set FFN_EAGER=0 to capture them anyway.
+FFN_EAGER=${FFN_EAGER:-1}
+FFN_GRAPH_ARGS=()
+[ "$FFN_EAGER" = 1 ] && FFN_GRAPH_ARGS=(--enforce-eager)
+# Attention-side run mode:
+#   1 -- eager (the default)
+#   0 -- FULL_DECODE_ONLY graphs; prefill steps still run eager
+#   2 -- FULL_DECODE_ONLY graphs plus the prefill token buckets
+ATTN_EAGER=${ATTN_EAGER:-1}
+PREFILL_BUCKETS=${PREFILL_BUCKETS:-}
 LOG_DIR=${LOG_DIR:-.}
 mkdir -p "$LOG_DIR"
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -60,6 +77,38 @@ API_PORT=${API_PORT:-18307}
 # whichever loses exits and takes its role down with it. Give it its own.
 FFN_API_PORT=${FFN_API_PORT:-$((API_PORT + 1))}
 
+# One capture bucket per decode size 1..MAX_NUM_SEQS. A single bucket at the
+# max would pad every decode batch up to it, and the empty-last-ubatch guard
+# then refuses to split any batch below half the bucket. ATTN_EAGER=2 adds the
+# prefill buckets on top, as capture sizes so the dispatcher's padding lands on
+# a captured graph. The plugin reads PREFILL_BUCKETS from the environment, and
+# it is an Attention-side strategy only -- the FFN role refuses to start when
+# it sees the variable -- so it goes on that one command, never on a shared
+# export.
+ATTN_GRAPH_ARGS=(--enforce-eager)
+ATTN_BUCKET_ENV=()
+if [ "$ATTN_EAGER" != 1 ]; then
+    BUCKET_SIZES=()
+    MAX_CAPTURE="$MAX_NUM_SEQS"
+    if [ "$ATTN_EAGER" = 2 ]; then
+        PREFILL_BUCKETS=${PREFILL_BUCKETS:-$MAX_NUM_BATCHED_TOKENS}
+        ATTN_BUCKET_ENV=(env "PREFILL_BUCKETS=$PREFILL_BUCKETS")
+        IFS=', ' read -r -a BUCKET_SIZES <<< "$PREFILL_BUCKETS"
+        for size in "${BUCKET_SIZES[@]}"; do
+            [ "$size" -gt "$MAX_CAPTURE" ] && MAX_CAPTURE=$size
+        done
+    fi
+    DECODE_SIZES=()
+    for size in $(seq 1 "$MAX_NUM_SEQS"); do
+        DECODE_SIZES+=("$size")
+    done
+    ATTN_GRAPH_ARGS=(
+        --max-cudagraph-capture-size "$MAX_CAPTURE"
+        --cudagraph-capture-sizes "${DECODE_SIZES[@]}" "${BUCKET_SIZES[@]}"
+        --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+    )
+fi
+
 AFD_CONFIG_ATTN='{
     "afd": {
         "role": "attention",
@@ -74,7 +123,7 @@ AFD_CONFIG_ATTN='{
 }'
 AFD_CONFIG_FFN=${AFD_CONFIG_ATTN/\"role\": \"attention\"/\"role\": \"ffn\"}
 
-CUDA_VISIBLE_DEVICES="$ATTN_DEVICES" "${VLLM_CMD[@]}" serve "$MODEL_PATH" \
+CUDA_VISIBLE_DEVICES="$ATTN_DEVICES" "${ATTN_BUCKET_ENV[@]}" "${VLLM_CMD[@]}" serve "$MODEL_PATH" \
     --data-parallel-size 2 \
     --tensor-parallel-size 1 \
     --enable-expert-parallel \
@@ -86,7 +135,7 @@ CUDA_VISIBLE_DEVICES="$ATTN_DEVICES" "${VLLM_CMD[@]}" serve "$MODEL_PATH" \
     --kv-cache-dtype "$KV_CACHE_DTYPE" \
     --api-server-count 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --enforce-eager \
+    "${ATTN_GRAPH_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     --host 127.0.0.1 \
     --port "$API_PORT" \
@@ -105,7 +154,7 @@ CUDA_VISIBLE_DEVICES="$FFN_DEVICES" "${VLLM_CMD[@]}" serve "$MODEL_PATH" \
     --kv-cache-dtype "$KV_CACHE_DTYPE" \
     --api-server-count 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --enforce-eager \
+    "${FFN_GRAPH_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     --host 127.0.0.1 \
     --port "$FFN_API_PORT" \
