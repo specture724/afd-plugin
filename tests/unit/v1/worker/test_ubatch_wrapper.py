@@ -63,3 +63,45 @@ def test_replay_refused_when_the_step_rebuilt_a_buffer():
     assert _refresh_metadata_pair(captured, fresh) is False
     # And it must not have written into the captured tensor on the way out.
     assert int(captured_cu.sum()) == 0
+
+
+def test_replay_copies_the_values_when_the_experiment_flag_is_on(monkeypatch):
+    # AFD_UBATCH_REPLAY_COPY trades the identity precondition for a shape
+    # check plus a copy, which is what a DBO step needs -- its per-ubatch
+    # metadata is cloned per step, so identity can never hold.
+    from afd_plugin.v1.worker import ubatch_wrapper
+
+    monkeypatch.setattr(ubatch_wrapper, "_UBATCH_REPLAY_COPY", True)
+
+    captured_seq = torch.zeros(4, dtype=torch.int32)
+    fresh_seq = torch.arange(4, dtype=torch.int32)
+    block_table = torch.zeros((4, 2), dtype=torch.int32)
+    slot_mapping = torch.zeros(8, dtype=torch.int64)
+    captured_cu = torch.zeros(5, dtype=torch.int32)
+
+    captured = _metadata(captured_seq, block_table, slot_mapping, captured_cu)
+    fresh = _metadata(fresh_seq, block_table.clone(), slot_mapping, torch.arange(5))
+
+    assert _refresh_metadata_pair(captured, fresh) is True
+    assert torch.equal(captured_seq, fresh_seq)
+
+
+def test_replay_still_refuses_a_shape_mismatch_under_the_flag(monkeypatch):
+    from afd_plugin.v1.worker import ubatch_wrapper
+
+    monkeypatch.setattr(ubatch_wrapper, "_UBATCH_REPLAY_COPY", True)
+
+    captured = _metadata(
+        torch.zeros(4, dtype=torch.int32),
+        torch.zeros((4, 2), dtype=torch.int32),
+        torch.zeros(8, dtype=torch.int64),
+        torch.zeros(5, dtype=torch.int32),
+    )
+    fresh = _metadata(
+        torch.zeros(6, dtype=torch.int32),
+        torch.zeros((6, 2), dtype=torch.int32),
+        torch.zeros(12, dtype=torch.int64),
+        torch.zeros(7, dtype=torch.int32),
+    )
+
+    assert _refresh_metadata_pair(captured, fresh) is False

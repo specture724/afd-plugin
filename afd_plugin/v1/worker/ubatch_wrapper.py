@@ -33,6 +33,14 @@ from afd_plugin.v1.worker.attention_metadata import build_ubatch_dp_metadata_lis
 # computes, and which are already captured. Set AFD_UBATCH_GRAPH_DEBUG=1.
 _UBATCH_GRAPH_DEBUG = bool(os.environ.get("AFD_UBATCH_GRAPH_DEBUG"))
 
+# Experiment switch for the DBO prefill replay path. Off, a replay requires the
+# captured metadata buffers to be the very ones this step wrote (see
+# _refresh_metadata_pair); on, matching shapes are enough and the values are
+# copied in. Copying is what a DBO step needs -- split_attn_metadata clones per
+# step -- but a previous attempt at it crashed the engine core under load, and
+# the cause was never isolated. Default off until it is.
+_UBATCH_REPLAY_COPY = bool(os.environ.get("AFD_UBATCH_REPLAY_COPY"))
+
 # How often to report the replay share. Frequent enough to see it in a short
 # benchmark, rare enough not to write a line per step.
 _REPLAY_LOG_EVERY = 200
@@ -462,8 +470,15 @@ def _refresh_metadata_pair(
             continue
         if captured_field is None or fresh_field is None:
             return False
-        if captured_field.data_ptr() != fresh_field.data_ptr():
+        if captured_field.data_ptr() == fresh_field.data_ptr():
+            continue
+        if not _UBATCH_REPLAY_COPY:
             return False
+        # AFD_UBATCH_REPLAY_COPY: feed the captured buffer instead of refusing.
+        if captured_field.shape != fresh_field.shape:
+            return False
+        with torch.inference_mode():
+            captured_field.copy_(fresh_field, non_blocking=True)
 
     captured_prefill = getattr(captured_metadata, "prefill", None)
     fresh_prefill = getattr(fresh_metadata, "prefill", None)
