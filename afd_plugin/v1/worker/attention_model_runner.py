@@ -53,8 +53,18 @@ from afd_plugin.v1.worker.attention_metadata import (
     AFDMetadataProviderMixin,
     _resolve_world_ranks,
 )
-from afd_plugin.v1.worker.cuda_graph import validate_cuda_graph_mode
-from afd_plugin.v1.worker.ubatch_wrapper import AFDUBatchWrapper
+from afd_plugin.v1.worker.cuda_graph import (
+    AFDCUDAGraphPolicy,
+    validate_cuda_graph_mode,
+)
+from afd_plugin.v1.worker.prefill_buckets import (
+    MLA_REORDER_BATCH_THRESHOLD,
+    prefill_bucket_capture_reqs,
+    resolve_prefill_bucket,
+)
+from afd_plugin.v1.worker.ubatch_wrapper import (
+    AFDUBatchWrapper,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -109,6 +119,14 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
     # ubatching" instead of raising on a missing attribute.
     _afd_async_extra_info: GpuAsyncExtraInfo | None = None
     _afd_async_moe_ubatch_metadata: AsyncMoeUbatchMetadata | None = None
+    # Same rationale: a default-disabled graph policy, so the bucket scheme is
+    # off for runners that never resolved one.
+    afd_cudagraph_policy: AFDCUDAGraphPolicy = AFDCUDAGraphPolicy(
+        enabled=False,
+        mode_name=None,
+        allow_attention_full_decode_only=False,
+        enable_ffn_graph_cache=False,
+    )
 
     def __init__(
         self,
@@ -432,6 +450,22 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         with _dp_batch_coordination_disabled(
             self.connector.control_plane is None,
         ):
+            # ### PATCH START: pad eligible prefill steps to their bucket.
+            bucket_padding, force_prefill_eager = self._resolve_prefill_bucket_decision(
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                force_uniform_decode=force_uniform_decode,
+            )
+            if bucket_padding is not None:
+                num_tokens = bucket_padding
+            elif force_prefill_eager:
+                # A prefill step the bucketed graphs cannot replay: keep it
+                # out of FULL dispatch entirely, or the dispatcher would pad
+                # it onto a bucket key whose metadata shape cannot be fed.
+                force_eager = True
+            # ### PATCH END: pad eligible prefill steps to their bucket.
             (
                 cudagraph_mode,
                 batch_descriptor,
@@ -545,6 +579,134 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         padded_tokens = batch_descriptor.num_tokens
         return not is_last_ubatch_empty(num_tokens, padded_tokens, num_ubatches)
 
+    # Patch reason: the upstream dispatcher only registers FULL keys for
+    # uniform decode batches, so a prefill step can never dispatch onto a
+    # FULL graph.
+    # Patch functionality: after upstream key initialization, verify the AFD
+    # prefill buckets sit inside vLLM's cudagraph capture sizes (the
+    # dispatcher pads steps via that list, so a bucket outside it would never
+    # be hit) and register one non-uniform FULL key per bucket, with num_reqs
+    # pinned to the value the dispatcher's non-uniform descriptor computes.
+    # Signature: matches upstream; no added parameters.
+    # Upstream: vLLM v0.26.0, vllm/v1/worker/gpu_model_runner.py
+    # Commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    def _check_and_update_cudagraph_mode(
+        self,
+        attention_backends: Any,
+        kv_cache_groups: Any,
+        is_profiling: bool = False,
+    ) -> None:
+        super()._check_and_update_cudagraph_mode(
+            attention_backends,
+            kv_cache_groups,
+            is_profiling,
+        )
+        self._register_prefill_bucket_keys()
+
+    def _register_prefill_bucket_keys(self) -> None:
+        """Register one non-uniform FULL dispatch key per prefill bucket.
+
+        Upstream only registers FULL keys for uniform decode batches, so a
+        prefill step could never dispatch onto a FULL graph. The buckets must
+        sit inside vLLM's cudagraph capture sizes because the dispatcher pads
+        steps via that list -- a bucket outside it would never be hit -- and
+        num_reqs is pinned to the value the dispatcher's non-uniform
+        descriptor computes, because FULL dispatch requires an exact key
+        match.
+        """
+        # ### PATCH START: register prefill bucket FULL keys.
+        buckets = self.afd_cudagraph_policy.prefill_buckets
+        if not buckets:
+            return
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes or []
+        missing = [b for b in buckets if b not in capture_sizes]
+        if missing:
+            raise RuntimeError(
+                "AFD prefill buckets must be cudagraph capture sizes for the "
+                f"dispatcher to pad onto them; missing {missing} from "
+                f"cudagraph_capture_sizes={sorted(capture_sizes)}. Add them "
+                "via --cudagraph-capture-sizes.",
+            )
+        if max(buckets) > self.max_num_tokens:
+            raise RuntimeError(
+                f"AFD prefill bucket {max(buckets)} exceeds the step token "
+                f"limit {self.max_num_tokens}.",
+            )
+        max_num_seqs = self.scheduler_config.max_num_seqs
+        for bucket in buckets:
+            num_reqs = prefill_bucket_capture_reqs(bucket, max_num_seqs)
+            if num_reqs < 2:
+                raise RuntimeError(
+                    f"AFD prefill bucket {bucket} pins num_reqs={num_reqs}; "
+                    "the scheme needs at least two requests so the DBO "
+                    "splitter has a boundary.",
+                )
+            self.cudagraph_dispatcher.add_cudagraph_key(
+                CUDAGraphMode.FULL,
+                BatchDescriptor(
+                    num_tokens=bucket,
+                    num_reqs=num_reqs,
+                    uniform=False,
+                ),
+            )
+        # ### PATCH END: register prefill bucket FULL keys.
+
+    def _resolve_prefill_bucket_decision(
+        self,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+        max_num_scheduled_tokens: int,
+        force_uniform_decode: bool | None,
+    ) -> tuple[int | None, bool]:
+        """Decide how the prefill bucket scheme handles this step.
+
+        Returns ``(bucket_padding, force_eager)``: pad ``num_tokens`` up to
+        the returned bucket before dispatch, or force the step out of cudagraph
+        dispatch entirely. Decode steps and the bucket scheme being disabled
+        leave both at their upstream values.
+
+        A bucketed prefill graph replays correctly only for steps whose
+        attention metadata has the captured shape: every request still in its
+        first prefill step. Two host-side facts would silently break that and
+        therefore force eager:
+        - a first request at or below MLA's decode threshold makes the
+          metadata builder classify the step through the decode pathway
+          (``split_decodes_and_prefills`` keys off the first request), so the
+          prefill metadata the graph's kernels read is never rebuilt;
+        - a request with prior computed context needs chunked-context
+          kernels the graph does not contain.
+        """
+        buckets = self.afd_cudagraph_policy.prefill_buckets
+        if not buckets:
+            return None, False
+        if force_uniform_decode or self._is_uniform_decode(
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            uniform_decode_query_len=self.uniform_decode_query_len,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            force_uniform_decode=force_uniform_decode,
+        ):
+            return None, False
+        # The capture path sizes its own synthetic batch; the guard reads
+        # live request state that does not exist yet during warmup/capture.
+        if self._is_warmup or self._afd_is_graph_capturing:
+            return None, False
+        if num_tokens < int(self.parallel_config.dbo_prefill_token_threshold):
+            # Below the DBO threshold the step runs whole anyway; leave it
+            # eager instead of paying the bucket's padding compute.
+            return None, False
+        if (
+            num_scheduled_tokens_np.size == 0
+            or int(num_scheduled_tokens_np[0]) <= MLA_REORDER_BATCH_THRESHOLD
+        ):
+            return None, True
+        computed = np.asarray(self.input_batch.num_computed_tokens_cpu[:num_reqs])
+        if computed.size and int(computed.max()) > 0:
+            return None, True
+        return resolve_prefill_bucket(buckets, num_tokens), False
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -590,6 +752,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        create_prefill_bucket_batch: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run vLLM's DP dummy batch through the AFD model path.
 
@@ -629,6 +792,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
                     is_graph_capturing,
                     num_active_loras,
                     profile_seq_lens,
+                    create_prefill_bucket_batch,
                 )
         finally:
             self._afd_is_graph_capturing = previous_is_graph_capturing
@@ -664,6 +828,15 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
 
+        # ### PATCH START: prefill buckets capture through the ubatch path.
+        create_prefill_bucket_batch = self._is_prefill_bucket_desc(desc)
+        if create_prefill_bucket_batch:
+            # Upstream only cooperatively captures uniform decode batches;
+            # a prefill bucket graph is equally a two-ubatch cooperative
+            # capture, so force the same path.
+            allow_microbatching = True
+        # ### PATCH END: prefill buckets capture through the ubatch path.
+
         # ### PATCH START: expose warmup state to the AFD control plane.
         previous_is_warmup = bool(self._is_warmup)
         try:
@@ -679,6 +852,7 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
                     remove_lora=False,
                     num_active_loras=desc.num_active_loras,
                     profile_seq_lens=profile_seq_lens,
+                    create_prefill_bucket_batch=create_prefill_bucket_batch,
                 )
         finally:
             self._is_warmup = previous_is_warmup
@@ -726,12 +900,18 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
                     num_active_loras=desc.num_active_loras,
                     is_graph_capturing=True,
                     profile_seq_lens=profile_seq_lens,
+                    create_prefill_bucket_batch=create_prefill_bucket_batch,
                 )
         finally:
             self._afd_is_graph_capturing = previous_is_graph_capturing
             self._afd_suppress_metadata_send = previous_suppress_send
             self._afd_pending_metadata = previous_metadata
         # ### PATCH END: publish static AFD state before graph capture.
+
+    def _is_prefill_bucket_desc(self, desc: BatchDescriptor) -> bool:
+        """Whether this capture descriptor is one of the prefill buckets."""
+        buckets = self.afd_cudagraph_policy.prefill_buckets
+        return bool(buckets) and not desc.uniform and desc.num_tokens in buckets
 
     # Patch reason: AFD owns an additional profiler and connector lifecycle.
     # Patch functionality: preserve native GPUModelRunner cleanup, then close
