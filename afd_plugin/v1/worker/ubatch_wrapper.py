@@ -47,6 +47,18 @@ _REPLAY_LOG_EVERY = 200
 
 logger = init_logger(f"vllm.{__name__}")
 
+# Why a split step did not replay, tallied by reason. "Graphs are on" and
+# "steps replay" are different claims, and when they diverge the useful
+# question is which precondition refused -- counting that is cheaper than
+# reasoning about it from the outside.
+_REFUSALS: dict[str, int] = {}
+
+
+def _refuse(reason: str) -> bool:
+    """Record why this step cannot replay, and return the refusal."""
+    _REFUSALS[reason] = _REFUSALS.get(reason, 0) + 1
+    return False
+
 
 class AFDUBatchWrapper(UBatchWrapper):
     # Class-level so a wrapper built without touching __init__ still counts.
@@ -200,6 +212,10 @@ class AFDUBatchWrapper(UBatchWrapper):
             return cudagraph_metadata.outputs
 
         self._afd_eager_ubatches += 1
+        if cudagraph_runtime_mode is not CUDAGraphMode.FULL:
+            _refuse("not_full_dispatch")
+        elif num_tokens not in self.cudagraphs:
+            _refuse("no_captured_key")
         self._maybe_log_replay_share()
         ubatch_metadata = self._make_ubatch_metadata(
             ubatch_slices=ubatch_slices,
@@ -230,12 +246,13 @@ class AFDUBatchWrapper(UBatchWrapper):
         split = self._afd_replays + self._afd_eager_ubatches
         logger.info(
             "AFD ubatch path: replays=%d eager_ubatch=%d unsplit=%d "
-            "split_share=%.0f%% replay_share_of_split=%.0f%%",
+            "split_share=%.0f%% replay_share_of_split=%.0f%% refusals=%s",
             self._afd_replays,
             self._afd_eager_ubatches,
             self._afd_unsplit_steps,
             100.0 * split / max(total, 1),
             100.0 * self._afd_replays / max(split, 1),
+            dict(sorted(_REFUSALS.items(), key=lambda kv: -kv[1])),
         )
 
     def _install_missing_afd_metadata(
@@ -385,7 +402,7 @@ def refresh_captured_attention_metadata(
     fresh_list = forward_context.attn_metadata
     ubatch_metadata_list = cudagraph_metadata.ubatch_metadata
     if not isinstance(fresh_list, list) or len(fresh_list) != len(ubatch_metadata_list):
-        return False
+        return _refuse("ubatch_count")
 
     for ubatch_metadata, fresh_per_layer in zip(
         ubatch_metadata_list, fresh_list, strict=True
@@ -473,24 +490,24 @@ def _refresh_metadata_pair(
         if captured_field.data_ptr() == fresh_field.data_ptr():
             continue
         if not _UBATCH_REPLAY_COPY:
-            return False
+            return _refuse(f"{field}_identity")
         # AFD_UBATCH_REPLAY_COPY: feed the captured buffer instead of refusing.
         if captured_field.shape != fresh_field.shape:
-            return False
+            return _refuse(f"{field}_shape")
         with torch.inference_mode():
             captured_field.copy_(fresh_field, non_blocking=True)
 
     captured_prefill = getattr(captured_metadata, "prefill", None)
     fresh_prefill = getattr(fresh_metadata, "prefill", None)
     if (captured_prefill is None) != (fresh_prefill is None):
-        return False
+        return _refuse("prefill_pathway")
     if captured_prefill is None:
         return True
     assert fresh_prefill is not None
     captured_cu = captured_prefill.query_start_loc
     fresh_cu = fresh_prefill.query_start_loc
     if captured_cu.shape != fresh_cu.shape:
-        return False
+        return _refuse("query_start_loc_shape")
     # The destination was allocated during capture, inside vLLM's inference
     # mode, so it is an inference tensor -- and writing one is only permitted
     # from inside inference mode. Refreshing it from a dummy run (which is not
