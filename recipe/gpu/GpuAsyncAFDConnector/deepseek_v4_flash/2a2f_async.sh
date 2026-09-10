@@ -4,6 +4,9 @@
 
 # 2A2F DeepSeek-V4-Flash on the async GPU connector.
 #
+# FFN_EAGER picks the FFN side's run mode; it defaults to eager, which is what
+# measured fastest on this model -- see the note on it below.
+#
 # Launch under a GPU reservation, which sets CUDA_VISIBLE_DEVICES:
 #   gpu run --gpus 4 -- \
 #     bash recipe/gpu/GpuAsyncAFDConnector/deepseek_v4_flash/2a2f_async.sh
@@ -17,6 +20,14 @@ MODEL_PATH=${MODEL_PATH:-/path/model_weights/deepseek-v4-flash}
 # How to invoke vLLM. `uv run vllm` is right from a synced checkout; override
 # to point at an interpreter that actually has the plugin installed.
 read -r -a VLLM_CMD <<< "${VLLM_CMD:-uv run vllm}"
+# The FFN experts run eagerly by default. Their padded graphs hold ~19 GiB
+# and buy nothing on V4: the FFN is compute-bound, so the per-item launch
+# saving is negligible, while a replay costs its whole captured bucket.
+# Measured pure prefill, 2A2F on 4x L20X, 128x1024 tokens: 17.9 s eager
+# against 19.0 s replaying every item. Set FFN_EAGER=0 to capture them anyway.
+FFN_EAGER=${FFN_EAGER:-1}
+FFN_GRAPH_ARGS=()
+[ "$FFN_EAGER" = 1 ] && FFN_GRAPH_ARGS=(--enforce-eager)
 LOG_DIR=${LOG_DIR:-.}
 mkdir -p "$LOG_DIR"
 export VLLM_USE_V2_MODEL_RUNNER=0
@@ -105,7 +116,7 @@ CUDA_VISIBLE_DEVICES="$FFN_DEVICES" "${VLLM_CMD[@]}" serve "$MODEL_PATH" \
     --kv-cache-dtype "$KV_CACHE_DTYPE" \
     --api-server-count 1 \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --enforce-eager \
+    "${FFN_GRAPH_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     --host 127.0.0.1 \
     --port "$FFN_API_PORT" \
