@@ -47,11 +47,10 @@ def _install_fake_forward_context(monkeypatch, events, *, stage_idx=2):
         "get_afd_metadata_from_forward_context",
         lambda: afd_metadata,
     )
-    monkeypatch.setattr(
-        adapter,
-        "get_forward_context",
-        lambda: SimpleNamespace(ubatch_idx=stage_idx),
-    )
+    # The stage is the DBO ubatch this thread is running, which vLLM tracks by
+    # thread rather than on the forward context. Off DBO the helper returns
+    # None and the metadata's own stage stands.
+    monkeypatch.setattr(adapter, "current_dbo_ubatch_id", lambda: stage_idx)
 
     def record_yield(hidden_states, *, role):
         events.append(("yield", hidden_states, role))

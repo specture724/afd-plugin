@@ -177,6 +177,10 @@ def register_afd() -> None:
         import afd_plugin.compat.patches.dp_coordinator_timeout  # noqa: F401
         import afd_plugin.compat.patches.engine_core  # noqa: F401
         import afd_plugin.compat.patches.ffn_local_moe_prepare  # noqa: F401
+        import afd_plugin.compat.patches.mla_prefill_cudagraph_capture  # noqa: F401
+        import afd_plugin.compat.patches.prefill_bucket_dummy_run  # noqa: F401
+        import afd_plugin.compat.patches.ubatch_positions  # noqa: F401
+        import afd_plugin.compat.patches.ubatch_split  # noqa: F401
     except Exception:
         _logger.debug(
             "AFD plugin: compatibility patches could not be applied",
