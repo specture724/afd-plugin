@@ -155,8 +155,9 @@ class _FakeTorchProfiler:
 def test_window_mode_records_one_window_and_exports_a_chrome_trace(
     monkeypatch, tmp_path
 ):
-    # The window is what lets two processes start and stop on the same wall
-    # clock; the step schedule cannot, because the FFN steps on idle polls.
+    # The window is what lets processes start and stop on the same wall clock.
+    # A thread drives it because the Attention runner steps too rarely at long
+    # prefill steps for step-driven start/stop to hit a few-second window.
     import json
     import time
 
@@ -169,22 +170,25 @@ def test_window_mode_records_one_window_and_exports_a_chrome_trace(
     monkeypatch.setenv("AFD_GPU_FFN_PROFILER_ENABLE", "1")
     monkeypatch.setenv("AFD_GPU_FFN_PROFILER_DIR", str(tmp_path / "traces"))
     monkeypatch.setenv("AFD_GPU_PROFILER_WINDOW_FILE", str(window))
-    monkeypatch.setattr(profiler_module, "_WINDOW_POLL_S", 0.0)
+    # A huge poll interval parks the thread so the test drives poll() itself.
+    monkeypatch.setattr(profiler_module, "_WINDOW_POLL_S", 3600.0)
 
     prof = profiler_module.create_afd_gpu_profiler("ffn")
     assert prof is not None
 
-    prof.step()  # no window file yet: nothing starts
+    prof.poll()  # no window file yet: nothing starts
     assert prof._profiler is None
 
     now = time.time()
     window.write_text(f"{now - 1} {now + 60} armX")
-    prof.step()
+    prof.poll()
     assert prof._profiler is not None
     torch.ones(4) * 2  # something for the trace to hold
+    prof.step()  # a no-op in window mode: the thread owns start/stop
+    assert prof._profiler is not None
 
     window.write_text(f"{now - 1} {now - 0.5} armX")  # window has closed
-    prof.step()
+    prof.poll()
     assert prof._profiler is None
 
     traces = list((tmp_path / "traces").glob("armX_ffn_*.json"))
@@ -193,5 +197,5 @@ def test_window_mode_records_one_window_and_exports_a_chrome_trace(
 
     # One window per process: reopening it does not record a second trace.
     window.write_text(f"{time.time() - 1} {time.time() + 60} armX")
-    prof.step()
+    prof.poll()
     assert prof._profiler is None

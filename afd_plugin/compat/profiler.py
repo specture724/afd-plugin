@@ -74,6 +74,13 @@ def afd_gpu_profiler_config(role: AFDGPUProfilerRole) -> AFDGPUProfilerConfig:
 class _WindowedProfiler:
     """Record exactly one wall-clock window, then export a Chrome trace.
 
+    A daemon thread owns start and stop. Driving them from the runners' step
+    calls does not work for the Attention role: it steps once per scheduler
+    step, which at 8192-token prefill is about a second, so a few-second window
+    opened and closed on step boundaries and recorded one step or none. CUPTI
+    and the op observers are process-wide, so starting the profiler from a side
+    thread still records every thread's CPU ops and every stream's kernels.
+
     Duck-types the two methods the runners call on a ``torch.profiler.profile``
     so the call sites need no change. The window is read from a file rather than
     from the environment because it has to be set after the servers are up and
@@ -81,13 +88,26 @@ class _WindowedProfiler:
     """
 
     def __init__(self, role: AFDGPUProfilerRole, trace_dir: str, window_file: str):
+        import threading
+
+        import torch
+
         self._role = role
         self._trace_dir = trace_dir
         self._window_file = window_file
         self._profiler: torch.profiler.profile | None = None
         self._tag = ""
-        self._next_poll = 0.0
         self._done = False
+        self._lock = threading.Lock()
+        # Captured here, on the runner's thread, where the device is bound; the
+        # window thread would otherwise see device 0.
+        self._device = torch.cuda.current_device() if torch.cuda.is_available() else -1
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"afd-{role}-profiler-window",
+            daemon=True,
+        )
+        self._thread.start()
 
     def _read_window(self) -> tuple[float, float, str] | None:
         try:
@@ -97,52 +117,56 @@ class _WindowedProfiler:
         except (OSError, ValueError):
             return None
 
-    def step(self) -> None:
-        if self._done:
-            return
-        # The FFN steps on every receive poll; reading the file each time would
-        # put a filesystem call on the hottest loop in the process.
-        now = time.monotonic()
-        if now < self._next_poll:
-            return
-        self._next_poll = now + _WINDOW_POLL_S
-        window = self._read_window()
-        if window is None:
-            return
-        start, stop, tag = window
-        wall = time.time()
-        if self._profiler is None and start <= wall < stop:
-            import torch
+    def _run(self) -> None:
+        while not self._done:
+            self.poll()
+            time.sleep(_WINDOW_POLL_S)
 
-            self._tag = tag
-            self._profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                record_shapes=False,
-                profile_memory=False,
-                with_stack=False,
-            )
-            self._profiler.start()
-            logger.warning("AFD %s profiler window %s started", self._role, tag)
-        elif self._profiler is not None and wall >= stop:
-            self._export()
+    def poll(self) -> None:
+        """Start or stop against the window file; the thread calls this."""
+        with self._lock:
+            if self._done:
+                return
+            window = self._read_window()
+            if window is None:
+                return
+            start, stop, tag = window
+            wall = time.time()
+            if self._profiler is None and start <= wall < stop:
+                import torch
+
+                self._tag = tag
+                self._profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                )
+                self._profiler.start()
+                logger.warning("AFD %s profiler window %s started", self._role, tag)
+            elif self._profiler is not None and wall >= stop:
+                self._export()
+
+    def step(self) -> None:
+        # The window thread owns start and stop.
+        return
 
     def stop(self) -> None:
-        if self._profiler is not None:
-            self._export()
+        with self._lock:
+            if self._profiler is not None:
+                self._export()
+            self._done = True
 
     def _export(self) -> None:
-        import torch
-
         assert self._profiler is not None
         self._profiler.stop()
-        device = torch.cuda.current_device() if torch.cuda.is_available() else -1
         os.makedirs(self._trace_dir, exist_ok=True)
         path = os.path.join(
             self._trace_dir,
-            f"{self._tag}_{self._role}_cuda{device}_pid{os.getpid()}.json",
+            f"{self._tag}_{self._role}_cuda{self._device}_pid{os.getpid()}.json",
         )
         self._profiler.export_chrome_trace(path)
         logger.warning(
