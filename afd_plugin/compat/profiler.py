@@ -144,11 +144,32 @@ class _WindowedProfiler:
                     record_shapes=False,
                     profile_memory=False,
                     with_stack=False,
+                    experimental_config=self._experimental_config(),
                 )
                 self._profiler.start()
                 logger.warning("AFD %s profiler window %s started", self._role, tag)
             elif self._profiler is not None and wall >= stop:
                 self._export()
+
+    def _experimental_config(self):
+        """Record every thread's CPU ops, on the Attention role only.
+
+        Started from this window thread, the profiler otherwise records CPU ops
+        for this thread alone -- which runs none -- so the trace keeps the
+        CUDA events and loses every operator name. Under DBO the forward runs
+        on two ubatch threads, and seeing which ubatch is doing what is the
+        point. The FFN role is left CUDA-only: its host side is a tight receive
+        poll whose ops would swamp the trace, and its GPU timeline is what
+        matters there.
+        """
+        if self._role != "attention":
+            return None
+        from torch._C._profiler import _ExperimentalConfig
+
+        try:
+            return _ExperimentalConfig(profile_all_threads=True)
+        except TypeError:  # older torch without the option
+            return None
 
     def step(self) -> None:
         # The window thread owns start and stop.
