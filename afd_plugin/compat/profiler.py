@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
@@ -30,6 +31,15 @@ _DEFAULT_ACTIVE_STEPS: Final[int] = 10
 _DEFAULT_REPEAT: Final[int] = 1
 _DEFAULT_SKIP_FIRST_STEPS: Final[int] = 0
 _VLLM_TORCH_PROFILER_DIR_ENV: Final[str] = "VLLM_TORCH_PROFILER_DIR"
+
+# Wall-clock window mode. The step schedule cannot line the two roles up: the
+# Attention runner steps once per scheduler step, but the connector-driven FFN
+# runner steps on every receive poll, idle ones included, so its wait/active
+# counts are consumed by spin long before traffic arrives. A window file holding
+# "<start_epoch> <stop_epoch> <tag>" starts and stops every process on the same
+# wall clock instead, which is also what lets their traces be merged.
+_WINDOW_FILE_ENV: Final[str] = "AFD_GPU_PROFILER_WINDOW_FILE"
+_WINDOW_POLL_S: Final[float] = 0.05
 
 
 @dataclass(frozen=True)
@@ -61,12 +71,103 @@ def afd_gpu_profiler_config(role: AFDGPUProfilerRole) -> AFDGPUProfilerConfig:
     )
 
 
+class _WindowedProfiler:
+    """Record exactly one wall-clock window, then export a Chrome trace.
+
+    Duck-types the two methods the runners call on a ``torch.profiler.profile``
+    so the call sites need no change. The window is read from a file rather than
+    from the environment because it has to be set after the servers are up and
+    warm, which is long after the environment was fixed.
+    """
+
+    def __init__(self, role: AFDGPUProfilerRole, trace_dir: str, window_file: str):
+        self._role = role
+        self._trace_dir = trace_dir
+        self._window_file = window_file
+        self._profiler: torch.profiler.profile | None = None
+        self._tag = ""
+        self._next_poll = 0.0
+        self._done = False
+
+    def _read_window(self) -> tuple[float, float, str] | None:
+        try:
+            with open(self._window_file) as handle:
+                start, stop, tag = handle.read().split()[:3]
+            return float(start), float(stop), tag
+        except (OSError, ValueError):
+            return None
+
+    def step(self) -> None:
+        if self._done:
+            return
+        # The FFN steps on every receive poll; reading the file each time would
+        # put a filesystem call on the hottest loop in the process.
+        now = time.monotonic()
+        if now < self._next_poll:
+            return
+        self._next_poll = now + _WINDOW_POLL_S
+        window = self._read_window()
+        if window is None:
+            return
+        start, stop, tag = window
+        wall = time.time()
+        if self._profiler is None and start <= wall < stop:
+            import torch
+
+            self._tag = tag
+            self._profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            self._profiler.start()
+            logger.warning("AFD %s profiler window %s started", self._role, tag)
+        elif self._profiler is not None and wall >= stop:
+            self._export()
+
+    def stop(self) -> None:
+        if self._profiler is not None:
+            self._export()
+
+    def _export(self) -> None:
+        import torch
+
+        assert self._profiler is not None
+        self._profiler.stop()
+        device = torch.cuda.current_device() if torch.cuda.is_available() else -1
+        os.makedirs(self._trace_dir, exist_ok=True)
+        path = os.path.join(
+            self._trace_dir,
+            f"{self._tag}_{self._role}_cuda{device}_pid{os.getpid()}.json",
+        )
+        self._profiler.export_chrome_trace(path)
+        logger.warning(
+            "AFD %s profiler window %s wrote %s", self._role, self._tag, path
+        )
+        self._profiler = None
+        self._done = True
+
+
 def create_afd_gpu_profiler(role: AFDGPUProfilerRole) -> torch.profiler.profile | None:
     """Create a torch profiler when the plugin-owned env enables it."""
 
     config = afd_gpu_profiler_config(role)
     if not config.enabled:
         return None
+
+    window_file = os.getenv(_WINDOW_FILE_ENV)
+    if window_file:
+        logger.warning(
+            "AFD GPU %s profiler in window mode: %s -> %s",
+            role,
+            window_file,
+            config.trace_dir,
+        )
+        return _WindowedProfiler(role, config.trace_dir, window_file)  # type: ignore[return-value]
 
     import torch
 

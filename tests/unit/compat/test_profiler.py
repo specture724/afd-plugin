@@ -150,3 +150,48 @@ class _FakeTorchProfiler:
     def profile(self, **kwargs):
         self.profile_kwargs = kwargs
         return self.created_profiler
+
+
+def test_window_mode_records_one_window_and_exports_a_chrome_trace(
+    monkeypatch, tmp_path
+):
+    # The window is what lets two processes start and stop on the same wall
+    # clock; the step schedule cannot, because the FFN steps on idle polls.
+    import json
+    import time
+
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from afd_plugin.compat import profiler as profiler_module
+
+    window = tmp_path / "window"
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_ENABLE", "1")
+    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_DIR", str(tmp_path / "traces"))
+    monkeypatch.setenv("AFD_GPU_PROFILER_WINDOW_FILE", str(window))
+    monkeypatch.setattr(profiler_module, "_WINDOW_POLL_S", 0.0)
+
+    prof = profiler_module.create_afd_gpu_profiler("ffn")
+    assert prof is not None
+
+    prof.step()  # no window file yet: nothing starts
+    assert prof._profiler is None
+
+    now = time.time()
+    window.write_text(f"{now - 1} {now + 60} armX")
+    prof.step()
+    assert prof._profiler is not None
+    torch.ones(4) * 2  # something for the trace to hold
+
+    window.write_text(f"{now - 1} {now - 0.5} armX")  # window has closed
+    prof.step()
+    assert prof._profiler is None
+
+    traces = list((tmp_path / "traces").glob("armX_ffn_*.json"))
+    assert len(traces) == 1
+    assert "traceEvents" in json.loads(traces[0].read_text())
+
+    # One window per process: reopening it does not record a second trace.
+    window.write_text(f"{time.time() - 1} {time.time() + 60} armX")
+    prof.step()
+    assert prof._profiler is None
