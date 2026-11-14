@@ -45,7 +45,7 @@ from vllm.v1.worker.workspace import (  # noqa: E402
     reset_workspace_manager,
 )
 
-from afd_plugin.config import DEEPEP_M2N_CONNECTOR  # noqa: E402
+from afd_plugin.config import AFD_ASYNC_GPU_CONNECTOR, DEEPEP_M2N_CONNECTOR  # noqa: E402
 from afd_plugin.connectors import AFDForwardContextMetadata  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from tests.conftest import REPO_ROOT  # noqa: E402
@@ -178,6 +178,7 @@ class _LoopbackFFN:
         self.vllm_config = vllm_config
         self.internal_router_moe = internal_router_moe
         self.external_router_moe = external_router_moe
+        self.remote_shared = False
         self.expected_payload: set[str] = set()
         self.output: torch.Tensor | None = None
 
@@ -195,6 +196,9 @@ class _LoopbackFFN:
                     topk_ids=payload["topk_ids"],
                 )
                 assert isinstance(output, torch.Tensor)
+                if self.remote_shared:
+                    shared = self.external_router_moe.shared_experts(hidden_states)
+                    output = output + shared
                 self.output = output.clone()
             elif payload:
                 self.output = self.external_router_moe.experts(
@@ -273,6 +277,7 @@ def _check_attention_moe_parity(
         (2, "P2pNcclAFDConnector", False, set()),
         (3, "P2pNcclAFDConnector", True, {"router_logits"}),
         (4, DEEPEP_M2N_CONNECTOR, True, {"topk_ids", "topk_weights"}),
+        (5, AFD_ASYNC_GPU_CONNECTOR, True, {"topk_ids", "topk_weights"}),
     ):
         vllm_config.additional_config["afd"] = {
             "role": "attention",
@@ -288,11 +293,12 @@ def _check_attention_moe_parity(
                 vllm_config=vllm_config,
                 prefix=f"model.layers.{layer_idx}.mlp",
                 compute_gate_on_attention=gate_on_attention,
-                sends_routes=connector == DEEPEP_M2N_CONNECTOR,
+                connector=connector,
             ),
             vllm_config,
         )
         loopback.expected_payload = payload
+        loopback.remote_shared = connector == AFD_ASYNC_GPU_CONNECTOR
         for num_tokens in PARITY_TOKEN_COUNTS:
             hidden_states = _pattern(num_tokens * PARITY_HIDDEN_SIZE, INPUT_PATTERN)
             hidden_states = hidden_states.view(num_tokens, -1).to(torch.bfloat16)
@@ -300,7 +306,27 @@ def _check_attention_moe_parity(
                 with override_forward_context(attention_context):
                     actual = attention_moe(hidden_states.clone()).clone()
                 with set_forward_context(None, vllm_config, num_tokens=num_tokens):
-                    native_output = internal_router_moe(hidden_states.clone()).clone()
+                    if loopback.remote_shared:
+                        logits, _ = internal_router_moe.gate(hidden_states)
+                        weights, ids = (
+                            internal_router_moe.experts.router.select_experts(
+                                hidden_states, logits
+                            )
+                        )
+                        routed = (
+                            internal_router_moe.experts.routed_experts.forward_modular(
+                                x=hidden_states,
+                                topk_weights=weights * hf_config.routed_scaling_factor,
+                                topk_ids=ids,
+                            )
+                        )
+                        native_output = routed + internal_router_moe.shared_experts(
+                            hidden_states
+                        )
+                    else:
+                        native_output = internal_router_moe(
+                            hidden_states.clone()
+                        ).clone()
             torch.testing.assert_close(actual, native_output, rtol=0, atol=0)
 
 

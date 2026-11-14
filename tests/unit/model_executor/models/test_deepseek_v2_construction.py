@@ -453,7 +453,7 @@ def _remote_experts_shell(monkeypatch, *, compute_gate_on_attention: bool):
             vllm_config=config,
             prefix="model.layers.1.mlp",
             compute_gate_on_attention=compute_gate_on_attention,
-            sends_routes=False,
+            connector="P2pNcclAFDConnector",
         )
 
 

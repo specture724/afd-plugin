@@ -9,6 +9,7 @@ hidden states between the Attention and FFN roles through the AFD connector.
 """
 
 from collections.abc import Iterable
+from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from functools import partial
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -23,10 +24,11 @@ from vllm.model_executor.models import deepseek_v2 as native
 
 from afd_plugin.config import (
     AFD_ASYNC_CONNECTOR,
+    AFD_ASYNC_GPU_CONNECTOR,
     DEEPEP_M2N_CONNECTORS,
     parse_afd_config,
 )
-from afd_plugin.connectors import AFDExpertRoutingSpec
+from afd_plugin.connectors import AFDExpertRoutingSpec, AFDF2ATransferPayload
 from afd_plugin.model_executor.ffn.remote import RemoteFFNProxy, build_expert
 from afd_plugin.model_executor.models._weight_utils import (
     ATTENTION_ROLE,
@@ -184,7 +186,7 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
     # connector sends routes (DeepEP M2N), Attention also builds the shared
     # experts, and with TP > 1 each TP rank sends only its slice.
     # Signature: AFD-owned; takes vllm_config for the factory, adds
-    # compute_gate_on_attention and sends_routes, and omits quant_config
+    # compute_gate_on_attention and connector, and omits quant_config
     # because no local expert kernel is constructed.
     # Upstream: vLLM v0.32.0, vllm/model_executor/models/deepseek_v2.py
     # Commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
@@ -195,15 +197,18 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         vllm_config: VllmConfig,
         prefix: str,
         compute_gate_on_attention: bool,
-        sends_routes: bool,
+        connector: str,
     ) -> None:
         # ### PATCH START: construct a remote-experts native MoE shell.
         nn.Module.__init__(self)
         parallel_config = vllm_config.parallel_config
         # Every Attention TP rank holds the same tokens; sending routes from
         # each would make the FFN run every token TP times.
+        is_async_gpu = connector == AFD_ASYNC_GPU_CONNECTOR
+        routes_with_local_shared = connector in DEEPEP_M2N_CONNECTORS
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe or (
-            sends_routes and parallel_config.tensor_parallel_size > 1
+            (is_async_gpu or routes_with_local_shared)
+            and parallel_config.tensor_parallel_size > 1
         )
 
         router_dtype = native._get_moe_router_dtype(config)
@@ -236,8 +241,7 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
         self.n_local_physical_experts = self.n_physical_experts // ep_size
         # Shared experts are never fused into this shell's remote experts.
         self.is_fused_shared_expert_enabled = False
-        # With routes, the FFN runs only the routed experts, so Attention runs
-        # the shared experts; otherwise the FFN runs the whole MoE.
+        # Only DeepEP M2N keeps the shared MLP on Attention.
         self.shared_experts = (
             native.DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -249,9 +253,17 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
-            if sends_routes and config.n_shared_experts
+            if routes_with_local_shared and config.n_shared_experts
             else None
         )
+        routed_scale = getattr(config, "routed_scaling_factor", 1.0)
+        if (
+            is_async_gpu
+            and config.n_shared_experts
+            and vllm_config.model_config.dtype == torch.float16
+        ):
+            # The FFN scales its FP16 shared output down before returning it.
+            routed_scale = 1.0
         self.experts = build_expert(
             vllm_config,
             gate=self.gate,
@@ -266,7 +278,7 @@ class AFDDeepseekV2RemoteExpertsMoE(native.DeepseekV2MoE):
             topk_group=getattr(config, "topk_group", 1),
             prefix=f"{prefix}.experts",
             scoring_func=getattr(config, "scoring_func", "softmax"),
-            routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+            routed_scaling_factor=routed_scale,
             e_score_correction_bias=(
                 None if self.gate is None else self.gate.e_score_correction_bias
             ),
@@ -341,6 +353,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         self.vllm_config = vllm_config
         self.config = config
         self.is_moe_layer = is_moe_layer
+        self.is_async_gpu = afd_config.connector == AFD_ASYNC_GPU_CONNECTOR
         self.compute_gate_on_attention = bool(
             afd_config.compute_gate_on_attention,
         )
@@ -393,7 +406,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.mlp",
                     compute_gate_on_attention=self.compute_gate_on_attention,
-                    sends_routes=afd_config.connector in DEEPEP_M2N_CONNECTORS,
+                    connector=afd_config.connector,
                 )
             elif self.compute_gate_on_attention and self.is_moe_layer:
                 self.mlp = GateOnlyRemoteMoE(
@@ -425,23 +438,45 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
                 if device_type == "npu":
                     native.FusedMoEFactory = fused_moe.FusedMoEFactory
                 moe_config = config
-                if afd_config.connector in _ATTENTION_SHARED_EXPERTS_CONNECTORS:
+                if (
+                    afd_config.connector in _ATTENTION_SHARED_EXPERTS_CONNECTORS
+                    or self.is_async_gpu
+                ):
                     moe_config = copy(config)
                     # HF validates this public field as int, but pinned native
                     # MoE uses only None to omit shared construction (0 builds
                     # a zero-width MLP). Apply its sentinel to this private
                     # construction copy; preserve the real model config.
                     object.__setattr__(moe_config, "n_shared_experts", None)
-                self.mlp = native.DeepseekV2MoE(
-                    config=moe_config,
-                    parallel_config=parallel_config,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.mlp",
-                    # aiter applies routed_scaling_factor internally
-                    apply_routed_scale_to_output=(
-                        not native.rocm_aiter_ops.is_fused_moe_enabled()
-                    ),
-                )
+                expert_factory_scope: AbstractContextManager[None] = nullcontext()
+                if self.is_async_gpu:
+                    from afd_plugin.model_executor.models.gpu.async_experts import (
+                        use_local_expert_factory,
+                    )
+
+                    expert_factory_scope = use_local_expert_factory(native)
+                with expert_factory_scope:
+                    self.mlp = native.DeepseekV2MoE(
+                        config=moe_config,
+                        parallel_config=parallel_config,
+                        quant_config=quant_config,
+                        prefix=f"{prefix}.mlp",
+                        apply_routed_scale_to_output=(
+                            not native.rocm_aiter_ops.is_fused_moe_enabled()
+                        ),
+                    )
+                if self.is_async_gpu and config.n_shared_experts:
+                    # Shared rows are a separate wire payload: never fuse them
+                    # into the routed expert bank or the native runner scheduler.
+                    self.mlp.shared_experts = native.DeepseekV2MLP(
+                        hidden_size=config.hidden_size,
+                        intermediate_size=config.moe_intermediate_size
+                        * config.n_shared_experts,
+                        hidden_act=config.hidden_act,
+                        quant_config=quant_config,
+                        reduce_results=False,
+                        prefix=f"{prefix}.mlp.shared_experts",
+                    )
                 if self.compute_gate_on_attention and device_type == "cuda":
                     # Keep the gate weights loadable, but with the runner's
                     # gate cleared it consumes the Attention-side router
@@ -547,7 +582,7 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         if self.compute_gate_on_attention and not self.is_moe_layer:
             raise RuntimeError(
                 "Dense DeepSeek layers are computed on the Attention side "
@@ -556,8 +591,25 @@ class AFDDeepseekV2DecoderLayer(native.DeepseekV2DecoderLayer):
         if self.compute_gate_on_attention:
             if native.current_platform.device_type == "npu":
                 raise RuntimeError("Async CAM FFN requires the layered executor")
+            if kwargs.get("group_list") is not None:
+                from afd_plugin.model_executor.models.gpu.async_experts import (
+                    compute_local_experts,
+                )
+
+                return compute_local_experts(
+                    self.mlp.experts.routed_experts,
+                    hidden_states=hidden_states,
+                    group_list=kwargs["group_list"],
+                    shared_experts=self.mlp.shared_experts,
+                    expand_x_shared=kwargs.get("expand_x_shared"),
+                    shared_scale=(
+                        1.0 / self.routed_scaling_factor
+                        if hidden_states.dtype == torch.float16
+                        else 1.0
+                    ),
+                )
             raise RuntimeError(
-                "GPU Attention-side gate must call compute_experts_output",
+                "GPU Attention-side gate must call compute_experts_output"
             )
         hidden_states = self.mlp(hidden_states)
         if (
@@ -735,7 +787,7 @@ class AFDDeepseekV2Model(native.DeepseekV2Model):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.layers[layer_idx].compute_ffn_output(
             hidden_states,
             **kwargs,
@@ -814,7 +866,7 @@ class AFDDeepseekV2ForCausalLM(native.DeepseekV2ForCausalLM):
         hidden_states: torch.Tensor,
         layer_idx: int,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AFDF2ATransferPayload:
         return self.model.compute_ffn_output(hidden_states, layer_idx, **kwargs)
 
     def compute_experts_output(

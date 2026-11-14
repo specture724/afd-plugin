@@ -44,7 +44,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 
-from afd_plugin.config import parse_afd_config
+from afd_plugin.config import AFD_ASYNC_GPU_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import (
     AFDConnectorFactory,
     AFDForwardContextMetadata,
@@ -468,7 +468,9 @@ def build_expert(
         "routed_output_transform": None,
         "n_shared_experts": None,
         "fuse_shared_experts": False,
-        "apply_routed_scale_to_output": True,
+        # Async GPU combines remote shared and routed rows in one result.
+        # Apply the factor to router weights before dispatch in that case.
+        "apply_routed_scale_to_output": afd_config.connector != AFD_ASYNC_GPU_CONNECTOR,
         "enable_eplb": False,
         "num_redundant_experts": 0,
         "is_sequence_parallel": False,
