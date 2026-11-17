@@ -131,7 +131,7 @@ AFDConnectorFactory.register_connector(
 )
 AFDConnectorFactory.register_connector(
     "GpuAsyncAFDConnector",
-    "afd_plugin.connectors.gpu.async_gpu",
+    "afd_plugin.connectors.gpu.async_nvshmem.connector",
     "GpuAsyncAFDConnector",
     attention_moe_runner=(
         "afd_plugin.model_executor.ffn.remote",
