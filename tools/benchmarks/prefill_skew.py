@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Measure prefill TTFT by request length with identical seeded arrival plans.
+"""Measure serving latency by request length with seeded arrival plans.
 
-One generated token isolates prefill. X-data-parallel-rank selects an actual
-vLLM DP replica, including for synchronous connectors. No server probe is used.
+One output token isolates prefill; --output-tokens also exercises decode.
+X-data-parallel-rank selects an actual DP replica. No server probe is used.
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ def plan(profile: str, rate: float, duration: float, seed: int) -> list[Arrival]
     return arrivals
 
 
-def payload(arrival: Arrival, model: str) -> bytes:
+def payload(arrival: Arrival, model: str, output_tokens: int = 1) -> bytes:
     rng = random.Random(arrival.token_seed)
     return json.dumps(
         {
@@ -81,8 +81,8 @@ def payload(arrival: Arrival, model: str) -> bytes:
             "prompt": [
                 rng.randrange(VOCAB_MIN, VOCAB_MAX) for _ in range(arrival.input_tokens)
             ],
-            "max_tokens": 1,
-            "min_tokens": 1,
+            "max_tokens": output_tokens,
+            "min_tokens": output_tokens,
             "ignore_eos": True,
             "temperature": 0,
             "stream": True,
@@ -98,6 +98,7 @@ async def request(
     arrival: Arrival,
     body: bytes,
     epoch: float,
+    output_tokens: int = 1,
 ) -> dict:
     scheduled = epoch + arrival.arrival_s
     await asyncio.sleep(max(0.0, scheduled - time.perf_counter()))
@@ -138,7 +139,7 @@ async def request(
             raise RuntimeError("Missing first token or final usage")
         if (
             usage["prompt_tokens"] != arrival.input_tokens
-            or usage["completion_tokens"] != 1
+            or usage["completion_tokens"] != output_tokens
         ):
             raise RuntimeError(f"Unexpected token usage: {usage}")
     except (aiohttp.ClientError, TimeoutError, RuntimeError, ValueError) as exc:
@@ -150,9 +151,13 @@ async def request(
         ttft_s=None if first is None else first - scheduled,
         service_ttft_s=None if first is None else first - started,
         elapsed_s=finished - scheduled,
+        tpot_s=(finished - first) / (output_tokens - 1)
+        if first is not None and output_tokens > 1
+        else None,
         finished_at_s=finished - epoch,
         usage=usage,
         output_text="".join(text_parts),
+        output_tokens=output_tokens,
         error=error,
     )
 
@@ -188,6 +193,16 @@ def summarize(rows: list[dict], duration: float) -> dict:
             offered_rps=len(selected) / duration,
             achieved_rps=len(successful) / elapsed,
             input_tokens_per_s=sum(r["input_tokens"] for r in successful) / elapsed,
+            output_tokens_per_s=sum(r["usage"]["completion_tokens"] for r in successful)
+            / elapsed,
+            e2e_mean_s=statistics.mean(r["elapsed_s"] for r in successful)
+            if successful
+            else None,
+            tpot_mean_s=statistics.mean(
+                r["tpot_s"] for r in successful if r["tpot_s"] is not None
+            )
+            if any(r["tpot_s"] is not None for r in successful)
+            else None,
             goodput_5s_rps=sum(v <= TTFT_SLO_S for v in values) / elapsed,
             arrival_window_goodput_5s_rps=sum(v <= TTFT_SLO_S for v in values)
             / duration,
@@ -215,7 +230,14 @@ async def run(args: argparse.Namespace) -> None:
             epoch = time.perf_counter()
             rows = await asyncio.gather(
                 *[
-                    request(session, args.url, a, payload(a, args.model), epoch)
+                    request(
+                        session,
+                        args.url,
+                        a,
+                        payload(a, args.model, args.output_tokens),
+                        epoch,
+                        args.output_tokens,
+                    )
                     for a in arrivals
                 ]
             )
@@ -245,11 +267,13 @@ async def run(args: argparse.Namespace) -> None:
                         )
                         for rank, n in enumerate(lengths)
                     ]
-                    bodies = [payload(a, args.model) for a in arrivals]
+                    bodies = [
+                        payload(a, args.model, args.output_tokens) for a in arrivals
+                    ]
                     epoch = time.perf_counter()
                     trial_rows = await asyncio.gather(
                         *[
-                            request(session, args.url, a, b, epoch)
+                            request(session, args.url, a, b, epoch, args.output_tokens)
                             for a, b in zip(arrivals, bodies, strict=True)
                         ]
                     )
@@ -259,6 +283,7 @@ async def run(args: argparse.Namespace) -> None:
                 summary = summarize(rows, time.perf_counter() - scenario_epoch)
                 pair_result = dict(
                     scenario=scenario,
+                    output_tokens=args.output_tokens,
                     summary=summary,
                     requests=rows,
                 )
@@ -274,12 +299,14 @@ async def run(args: argparse.Namespace) -> None:
                     seed = args.seed + repeat * 100000 + round(rate * 100)
                     arrivals = plan(profile, rate, args.duration, seed)
                     assert arrivals
-                    bodies = [payload(a, args.model) for a in arrivals]
+                    bodies = [
+                        payload(a, args.model, args.output_tokens) for a in arrivals
+                    ]
                     encoded_plan = json.dumps([asdict(a) for a in arrivals]).encode()
                     epoch = time.perf_counter()
                     rows = await asyncio.gather(
                         *[
-                            request(session, args.url, a, b, epoch)
+                            request(session, args.url, a, b, epoch, args.output_tokens)
                             for a, b in zip(arrivals, bodies, strict=True)
                         ]
                     )
@@ -288,6 +315,7 @@ async def run(args: argparse.Namespace) -> None:
                     )
                     result = dict(
                         profile=profile,
+                        output_tokens=args.output_tokens,
                         target_rps=rate,
                         repeat=repeat,
                         seed=seed,
@@ -328,6 +356,7 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=120)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--pairs", type=int, default=10)
+    parser.add_argument("--output-tokens", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20261117)
     args = parser.parse_args()
     if (
@@ -335,8 +364,11 @@ def main() -> None:
         or args.duration <= 0
         or args.repeats <= 0
         or args.pairs <= 0
+        or args.output_tokens <= 0
     ):
-        parser.error("rates, duration, repeats and pairs must be positive")
+        parser.error(
+            "rates, duration, repeats, pairs and output tokens must be positive"
+        )
     asyncio.run(run(args))
 
 

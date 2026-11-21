@@ -139,7 +139,7 @@ def main() -> None:
             "--dbo-decode-token-threshold",
             "2",
             "--dbo-prefill-token-threshold",
-            "12",
+            "512",
         ]
     procs = []
     logs = []

@@ -213,6 +213,9 @@ PADDED_FFN_BUCKET_ALIGNMENT = 128
 # when it is close to the item's own size. Items landing exactly on a bucket
 # still replay; the rest take the cheaper path.
 MAX_REPLAY_PADDING_RATIO = 1.05
+# Small work is launch-bound; power-of-two padding avoids per-layer launches.
+SMALL_FFN_GRAPH_MAX_ROWS = 1024
+SMALL_FFN_GRAPH_PADDING_RATIO = 2.0
 
 
 def resolve_padded_ffn_graph_fractions(
@@ -268,7 +271,9 @@ def padded_ffn_graph_buckets(
 
     The ladder need not reach ``max_routed``: an item above the largest bucket
     runs eager, the same fallback an item larger than the captured shape has
-    always taken. That is only safe because ``capture_padded_ffn_graphs`` pins
+    always taken. The default also captures power-of-two buckets through 1024
+    rows; explicit calibrations keep only their requested multiples.
+    That is only safe because ``capture_padded_ffn_graphs`` pins
     the shared MoE workspace at the ceiling before capturing -- see the note
     there; without it, the first oversized item grows the workspace and
     invalidates every captured graph.
@@ -277,6 +282,10 @@ def padded_ffn_graph_buckets(
         raise ValueError(f"max_routed must be positive; got {max_routed}")
     if ffn_size <= 0:
         raise ValueError(f"ffn_size must be positive; got {ffn_size}")
+    use_small_buckets = (
+        fractions is None
+        and not os.environ.get(PADDED_FFN_GRAPH_FRACTIONS_ENV, "").strip()
+    )
     if fractions is None:
         fractions = resolve_padded_ffn_graph_fractions()
     expected = max_routed / ffn_size
@@ -291,6 +300,12 @@ def padded_ffn_graph_buckets(
         buckets.add(min(max(rows, PADDED_FFN_BUCKET_ALIGNMENT), max_routed))
     if not buckets:
         raise ValueError("padded FFN graph multiples must not be empty")
+    if use_small_buckets:
+        # Decode and short prefills need launch savings below the large-batch ladder.
+        rows = 1
+        while rows <= min(max_routed, SMALL_FFN_GRAPH_MAX_ROWS):
+            buckets.add(rows)
+            rows *= 2
     return tuple(sorted(buckets))
 
 
@@ -328,8 +343,15 @@ def select_padded_ffn_bucket(
     ``None`` means no bucket fits and the caller runs the item eagerly, which
     is what an item larger than the captured maximum has always done. The
     shared rows are checked too, because each bucket's graph captures only its
-    own share of them.
+    own share of them. Large, heavily padded work stays eager even when it fits.
     """
+    if routed_rows <= 0:
+        return None
+    padding_ratio = (
+        SMALL_FFN_GRAPH_PADDING_RATIO
+        if routed_rows <= SMALL_FFN_GRAPH_MAX_ROWS
+        else MAX_REPLAY_PADDING_RATIO
+    )
     for bucket in buckets:
         if routed_rows > bucket:
             continue
@@ -337,7 +359,7 @@ def select_padded_ffn_bucket(
             bucket, max_routed=max_routed, max_shared=max_shared, ffn_size=ffn_size
         ):
             continue
-        return bucket
+        return bucket if bucket <= routed_rows * padding_ratio else None
     return None
 
 
