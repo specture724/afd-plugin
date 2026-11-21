@@ -218,7 +218,7 @@ def test_async_ffn_graph_bucket_preserves_both_routed_and_shared_capacity():
     assert (
         select_padded_ffn_bucket(
             buckets,
-            200,
+            256,
             20,
             max_routed=1024,
             max_shared=64,
@@ -226,7 +226,45 @@ def test_async_ffn_graph_bucket_preserves_both_routed_and_shared_capacity():
         == 512
     )
     assert shared_rows_for_bucket(512, max_routed=1024, max_shared=64) == 32
+    assert (
+        select_padded_ffn_bucket(buckets, 200, 20, max_routed=1024, max_shared=64)
+        is None
+    )
     assert select_padded_ffn_bucket(buckets, 600) is None
+
+
+@pytest.mark.parametrize(
+    "routed_rows,shared_rows,expected",
+    [
+        (3, 1, 4),
+        (13, 2, 16),
+        (384, 64, 512),
+        (784, 128, 1024),
+        (12000, 2000, 12288),
+        (12400, 2000, None),
+    ],
+)
+def test_default_async_graph_buckets_cover_small_work_without_overpadding_large_work(
+    monkeypatch, routed_rows, shared_rows, expected
+):
+    monkeypatch.delenv("AFD_FFN_GRAPH_FRACTIONS", raising=False)
+    buckets = padded_ffn_graph_buckets(24576, ffn_size=2)
+    assert (
+        select_padded_ffn_bucket(
+            buckets,
+            routed_rows,
+            shared_rows,
+            max_routed=24576,
+            max_shared=2048,
+            ffn_size=2,
+        )
+        == expected
+    )
+
+
+def test_async_ffn_explicit_bucket_calibration_keeps_its_requested_ladder(monkeypatch):
+    monkeypatch.setenv("AFD_FFN_GRAPH_FRACTIONS", "0.25,1")
+    assert padded_ffn_graph_buckets(24576, ffn_size=2) == (3072, 12288)
 
 
 @pytest.mark.parametrize("ffn_size", [1, 2, 4])

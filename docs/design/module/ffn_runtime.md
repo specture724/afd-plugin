@@ -422,6 +422,7 @@ items eagerly. Capture finishes before the cross-role rendezvous so Attention
 profiling can immediately dispatch. The connector's `FFNExecutionSession` owns
 the producer-drain handshake; worker shutdown retains model and transport
 resources until that session finishes. Local expert graphs and both stages have
-been exercised on single-node H20 with DeepSeek-V2-Lite-Chat. The
-[validation record](../async_gpu_cross_node_research.md) scopes that evidence;
-other model, quantization and multi-node cells remain unqualified.
+been exercised on single-node and two-node H20 with DeepSeek-V2-Lite-Chat. The
+[validation record](../async_gpu_cross_node_research.md) and
+[decode graph + DBO measurements](../async_gpu_dbo_graph_benchmark.md) scope that
+evidence; other models, quantization and larger topologies remain unqualified.

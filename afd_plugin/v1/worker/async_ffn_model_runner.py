@@ -25,7 +25,6 @@ from afd_plugin.connectors.gpu.async_nvshmem.connector import (
     GpuAsyncTransferState,
 )
 from afd_plugin.v1.worker.cuda_graph import (
-    MAX_REPLAY_PADDING_RATIO,
     pad_counts_to_shape,
     padded_ffn_graph_buckets,
     padded_ffn_graph_layer_fits,
@@ -106,22 +105,15 @@ class GPUAsyncFFNModelRunner(GPUFFNModelRunner):
             )
 
     def capture_padded_ffn_graphs(self) -> int:
-        """Capture the local experts once per MoE layer, at the maximum shape.
+        """Capture local experts for each MoE layer and row bucket.
 
-        The connector-driven path has no control plane, so nothing tells this
-        rank the shape of the next work item -- which is why it ran eagerly.
-        Padding removes the need to know: a grouped GEMM takes its grouping
-        from a device-side count vector rather than from its row count, so the
-        largest shape can be captured and every item padded up to it, with the
-        padding charged to the last expert and its output sliced off. Only the
-        counts differ between replays, and a replay re-reads them.
+        The connector supplies device-side expert counts for each work item.
+        Pad to the smallest suitable row bucket, charge padding to the last
+        expert, and slice it off the result. Replay re-reads the counts.
 
-        The shape is the largest batch the sender can produce,
-        ``max_num_batched_tokens``, so prefill and decode both replay it.
-
-        One graph per layer, because a graph records the weight pointers and
-        each layer has its own. Input buffers are shared across layers -- work
-        items are served one at a time on one stream.
+        Each layer has its own graphs because they record weight pointers.
+        Input buffers are shared across layers; work items are served one at
+        a time on one stream.
 
         Called once, before the connector joins its process group. That
         rendezvous is the only barrier between the roles, and the Attention
@@ -358,11 +350,6 @@ class GPUAsyncFFNModelRunner(GPUFFNModelRunner):
             if routed_rows > 0
             else None
         )
-        if bucket is not None and bucket > routed_rows * MAX_REPLAY_PADDING_RATIO:
-            # The padding this replay would carry costs more than the launches
-            # eager pays. Take the cheaper of the two per item rather than
-            # charging every item to the nearest bucket above it.
-            bucket = None
         graph = (
             self._padded_graphs.get((work_item.context.metadata.layer_idx, bucket))
             if bucket is not None
