@@ -17,6 +17,7 @@ microbatch execution; FFN expert graphs are independent of the arrival loop.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
@@ -32,6 +33,7 @@ from afd_plugin.connectors.base import AFDConnectorBase, FFNExecutionSession
 from afd_plugin.connectors.gpu.async_nvshmem.protocol import (
     FLAG_REPLY_READY,
     FLAG_SHUTDOWN_BIT,
+    H_NUM_TOKENS,
     H_ROUTED_TOKENS,
     H_SEGMENT_START,
     HEADER_FIXED_WORDS,
@@ -63,6 +65,8 @@ AFD_ASYNC_GPU_GROUP_NAME = "afd_async_gpu"
 logger = init_logger(f"vllm.{__name__}")
 AFD_ASYNC_DEBUG_ENV: Final[str] = "AFD_ASYNC_DEBUG"
 AFD_ASYNC_DEBUG_LAYERS: Final[int] = 3
+SHUTDOWN_POLL_INTERVAL_S: Final[float] = 0.01
+FAILURE_STORE_KEY: Final[str] = "async_gpu_failure"
 
 
 def _debug_norm(name: str, tensor: Tensor | None) -> str:
@@ -241,17 +245,29 @@ class _GpuAsyncFFNSession(FFNExecutionSession):
         self.connector = connector
 
     def keep_serving(self, shutdown_requested: bool) -> bool:
-        # Producers must finish their last CUDA-graph replay before receivers exit.
-        return not self.connector.producers_finished
+        return not shutdown_requested and not self.connector.producers_finished
 
     def drain(self, run_one: Callable[[], None]) -> None:
+        deadline = (
+            time.monotonic() + self.connector.afd_config.afd_process_group_timeout_s
+        )
         while not self.connector.producers_finished:
+            self.connector._check_peer_failure()
+            if time.monotonic() >= deadline:
+                error = TimeoutError(
+                    "Async GPU drain timed out waiting for Attention producers"
+                )
+                self.connector._publish_failure(error)
+                raise error
             try:
                 run_one()
             except TimeoutError:
                 continue
             except ConnectorShutdown:
                 break
+            except Exception as error:
+                self.connector._publish_failure(error)
+                raise
 
     def finish_receiver(self) -> None:
         self.validate_shutdown()
@@ -260,9 +276,11 @@ class _GpuAsyncFFNSession(FFNExecutionSession):
 
     def validate_shutdown(self) -> None:
         if not self.connector.producers_finished:
-            raise RuntimeError(
+            error = RuntimeError(
                 "Async GPU receiver still has active Attention producers"
             )
+            self.connector._publish_failure(error)
+            raise error
 
 
 class GpuAsyncAFDConnector(AFDConnectorBase):
@@ -371,7 +389,7 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
         )
 
         # Device headers have a separate routing tail for every live stage.
-        self._header_device: dict[tuple[int, int, int], Tensor] = {}
+        self._header_device: dict[tuple[int, int], Tensor] = {}
         self._seq_device: Tensor | None = None
         # Each stage builds its probe on its own stream; sharing a lazily
         # initialized probe would let a peer stage read it before its fill.
@@ -437,6 +455,7 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
             rank=self.world_rank,
             world_size=self.attn_size + self.ffn_size,
             num_stages=self.num_stages,
+            wait_timeout_s=self.afd_config.afd_process_group_timeout_s,
         )
         for stage in range(self.num_stages):
             self._free_rings[stage] = self._rings_for_stage(stage)
@@ -457,6 +476,20 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
         )
         self._initialized = True
 
+    def _publish_failure(self, error: Exception) -> None:
+        if self.window is None:
+            return
+        self.window.runtime.store.compare_set(
+            FAILURE_STORE_KEY, "", f"rank {self.world_rank}: {error}"
+        )
+
+    def _check_peer_failure(self) -> None:
+        store = self._require_initialized().runtime.store
+        if store.check([FAILURE_STORE_KEY]):
+            raise RuntimeError(
+                f"Async GPU peer failed: {store.get(FAILURE_STORE_KEY).decode()}"
+            )
+
     def close(self) -> None:
         """Drain producers, rendezvous closed participants, then free the world.
 
@@ -466,23 +499,35 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
         if self.window is None:
             return
         window = self.window
-        if self.is_attention:
-            torch.cuda.synchronize(window.device)
-            if any(self._pending.values()):
-                raise RuntimeError("Async GPU shutdown has an unconsumed dispatch")
-            self.announce_shutdown()
-            torch.cuda.current_stream(window.device).synchronize()
-        elif not self.receiver_finished:
-            raise RuntimeError(
-                "Async GPU FFN session must drain before connector close"
-            )
         store = window.runtime.store
         prefix = "async_gpu_closed:"
-        store.set(f"{prefix}{self.world_rank}", "1")
-        store.wait(
-            [f"{prefix}{rank}" for rank in range(self.attn_size + self.ffn_size)],
-            timedelta(seconds=self.afd_config.afd_process_group_timeout_s),
-        )
+        try:
+            self._check_peer_failure()
+            if self.is_attention:
+                if any(self._pending.values()):
+                    raise RuntimeError("Async GPU shutdown has an unconsumed dispatch")
+                torch.cuda.synchronize(window.device)
+                self.announce_shutdown()
+                torch.cuda.current_stream(window.device).synchronize()
+            elif not self.receiver_finished:
+                raise RuntimeError(
+                    "Async GPU FFN session must drain before connector close"
+                )
+            store.set(f"{prefix}{self.world_rank}", "1")
+            deadline = time.monotonic() + self.afd_config.afd_process_group_timeout_s
+            keys = [f"{prefix}{rank}" for rank in range(self.attn_size + self.ffn_size)]
+            while True:
+                self._check_peer_failure()
+                if store.check(keys):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Async GPU close timed out waiting for peer readiness"
+                    )
+                time.sleep(SHUTDOWN_POLL_INTERVAL_S)
+        except Exception as error:
+            self._publish_failure(error)
+            raise
         window.close()
         self.window = None
         if self.pg is not None:
@@ -540,26 +585,10 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
         self,
         *,
         layer_idx: int,
-        num_tokens: int,
         stage_idx: int,
     ) -> Tensor:
-        """Device headers for one dispatch shape, prefix already filled.
-
-        The prefix -- magic, version, layer, batch size, flags -- is fixed by
-        ``(stage_idx, layer_idx, num_tokens)`` and is written once. A dispatch
-        only rewrites the routing tail.
-
-        That the prefix never changes is what lets it leave the layer path. It
-        used to be copied down from the host on every dispatch, not to carry
-        anything new but to overwrite the previous layer's prefix in a buffer
-        every layer shared. One buffer per shape removes the overwrite, and
-        with it a strided host-to-device copy per MoE layer -- and, under a
-        CUDA graph, a copy node that re-shipped a constant on every replay.
-
-        Costs ``ffn_size * header_words`` int32s per distinct shape: MoE layers
-        times the token counts they run at, a few KiB in practice.
-        """
-        key = (stage_idx, layer_idx, num_tokens)
+        """One persistent header per stage/layer, independent of batch size."""
+        key = (stage_idx, layer_idx)
         headers = self._header_device.get(key)
         if headers is not None:
             return headers
@@ -582,7 +611,7 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
             # reaching this means the shape was never warmed.
             raise RuntimeError(
                 "AFD async GPU dispatch shape "
-                f"(layer={layer_idx}, num_tokens={num_tokens}) was first seen "
+                f"(layer={layer_idx}, stage={stage_idx}) was first seen "
                 "during CUDA graph capture; warm it before capturing",
             )
         # Outside inference mode on purpose. This cache outlives the call that
@@ -606,7 +635,7 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
         fill_header_prefix(
             headers,
             layer_idx=layer_idx,
-            num_tokens=num_tokens,
+            num_tokens=0,
             flags=0,
         )
         self._header_device[key] = headers
@@ -631,9 +660,9 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
         """
         headers = self._headers_for_shape(
             layer_idx=layer_idx,
-            num_tokens=num_tokens,
             stage_idx=stage_idx,
         )
+        headers[:, H_NUM_TOKENS] = num_tokens
         headers[:, H_ROUTED_TOKENS] = plan.routed_per_rank
         headers[:, H_SEGMENT_START] = plan.segment_start
         headers[:, HEADER_FIXED_WORDS:] = plan.counts.view(
@@ -929,6 +958,7 @@ class GpuAsyncAFDConnector(AFDConnectorBase):
                 raise ConnectorShutdown("All Attention producers announced shutdown")
             arrived = window.wait(timeout_s=timeout_ms / 1000.0 if timeout_ms else None)
             if arrived is None:
+                self._check_peer_failure()
                 raise TimeoutError("AFD async GPU dispatch recv timed out")
             if arrived.region >= self.attn_size:
                 raise RuntimeError("Async GPU arrival names a non-Attention region")

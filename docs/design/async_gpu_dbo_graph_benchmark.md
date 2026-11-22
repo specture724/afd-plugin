@@ -24,6 +24,12 @@ This is a bounded interoperability/performance qualification. Long random
 autoregressive probability parity versus full eager remains unqualified; the
 failed diagnostic and old-policy control are retained below.
 
+The performance data below is frozen at commit `c413402` (source hashes in the
+manifest). Subsequent review fixes add bounded reply waits, coordinated failure
+reporting and a shape-independent header cache. Those fixes require their own
+transport/model regression checks; the old timings are not relabeled as new
+measurements.
+
 ## Scope and implementation
 
 `GpuAsyncAFDConnector` already supported native MRV2 two-stage DBO and decode
@@ -262,3 +268,38 @@ The command above selects both features. Drop `--dbo` for graph alone; add
 `--eager` for DBO alone; use `--eager` without `--dbo` for both off. Use seeds
 20261122, 20361122 and 20461122 for the three formal rounds. Exact closed-loop
 commands, including warmups and random-dataset parameters, are in the manifest.
+
+## Review-fix regression checks
+
+The follow-up to `c413402` bounds drain and reply waits, publishes shutdown
+failures through the Store, and retains one header per stage/layer. Validation
+on 2026-11-22 used Slurm allocation 17001, H20 nodes 03/04, two GPUs per node,
+and a rebuilt CUDA/NVSHMEM extension:
+
+- Full unit suite: **1563 passed, 46 skipped**, no failures. Isolated package
+  checks without Torch/vLLM: **55 passed, 3 dependency-gated skips**.
+- Reproducing 16 eager shapes against `c413402` retains 16 headers and publishes
+  no failure on an unconsumed-dispatch close error; the fixed implementation
+  retains one header and publishes the first failure.
+- GPU connector suite: **10 passed, 2 skipped**. The skipped cases require
+  three/four local GPUs. Passing cases include all four missing-reply device
+  deadlines (mapped/native NVSHMEM, eager/graph), bounded retained CUDA memory
+  across eager batch sizes, and reverse-order replay of different batch graphs.
+- Cross-node DeepSeek-V2-Lite BF16, 2A2F, MLA decode full graph + DBO:
+  **819** teacher-forced positions, maximum logprob delta **0.457382** against
+  the native reference (guard 0.5); all **754** confident argmaxes unchanged.
+  All **12 concurrent requests completed 64 output tokens**, without errors.
+  Attention ranks recorded **63/63 two-stage graph replays**; FFN ranks
+  recorded **6427/6326 graph replays**, each serving both stages and producers.
+- Model cleanup required no forced termination. Attention exited 0; the
+  unused FFN API frontend exited 1 on the harness's shutdown interrupt while
+  waiting for engine startup. No connector failure was reported.
+- Python 3.11/3.12 mypy passed on the changed runtime and test modules.
+
+The model check uses decode/prefill DBO thresholds 2/12 to exercise both stages;
+it is a regression check, not a new performance measurement. The formal
+benchmark's prefill threshold remains 512. Raw logs, commands, XML results and
+replay counters are retained in `.venv/review-fixes-580/` on shared storage.
+Device reply timeouts invalidate the CUDA context and require restarting the
+whole AFD world; they do not provide in-process recovery. Native RMA/collective
+failures outside the reply-wait kernel still require library/supervisor cleanup.

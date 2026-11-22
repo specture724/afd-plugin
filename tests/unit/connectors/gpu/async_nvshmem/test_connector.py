@@ -13,6 +13,7 @@ import torch  # noqa: E402
 
 from afd_plugin.config import parse_afd_config  # noqa: E402
 from afd_plugin.connectors.gpu.async_nvshmem.connector import (  # noqa: E402
+    FAILURE_STORE_KEY,
     ConnectorShutdown,
     GpuAsyncAFDConnector,
     plan_dispatch,
@@ -148,8 +149,100 @@ def test_shutdown_waits_for_every_attention_producer(connector):
         ]
     )
     session = connector.ffn_session()
-    assert session.keep_serving(shutdown_requested=True)
+    assert session.keep_serving(shutdown_requested=False)
+    assert not session.keep_serving(shutdown_requested=True)
     with pytest.raises(ConnectorShutdown, match="All Attention"):
         connector.recv_attn_output(timeout_ms=1)
     assert not session.keep_serving(shutdown_requested=True)
     session.validate_shutdown()
+
+
+def test_dispatch_sends_current_batch_size_when_shapes_change(connector):
+    connector.window = RecordingAsyncWindow(defer_headers=True)
+    for count in range(1, 17):
+        hidden = torch.ones(count, 3)
+        connector.window.replies = {rank: torch.zeros_like(hidden) for rank in range(2)}
+        connector.send_attn_output(
+            hidden,
+            AFDTransferContext(
+                AFDTransferMetadata.create_attention_metadata(
+                    layer_idx=1, stage_idx=0, seq_len=count
+                )
+            ),
+            topk_ids=torch.zeros((count, 2), dtype=torch.int32),
+            topk_weights=torch.ones((count, 2)),
+        )
+        for message in connector.window.messages[-2:]:
+            assert (
+                decode_header_words(
+                    message["header"].tolist(), connector.layout
+                ).num_tokens
+                == count
+            )
+        connector.recv_ffn_output(hidden)
+
+
+@pytest.mark.parametrize("raises_poll_timeout", [False, True])
+def test_drain_expires_when_a_producer_disappears(
+    connector, monkeypatch, raises_poll_timeout
+):
+    clock = iter((0.0, 0.0, float(connector.afd_config.afd_process_group_timeout_s)))
+    monkeypatch.setattr(
+        "afd_plugin.connectors.gpu.async_nvshmem.connector.time",
+        SimpleNamespace(monotonic=lambda: next(clock)),
+    )
+
+    def run_one():
+        if raises_poll_timeout:
+            raise TimeoutError("empty poll")
+
+    with pytest.raises(TimeoutError, match="drain timed out"):
+        connector.ffn_session().drain(run_one)
+    assert b"drain timed out" in connector.window.runtime.store.get(FAILURE_STORE_KEY)
+    assert not connector.window.closed
+
+
+def test_close_failure_notifies_other_ranks_without_freeing_live_window(
+    connector, monkeypatch
+):
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    hidden = torch.ones(2, 3)
+    connector.send_attn_output(
+        hidden,
+        _context(0),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int32),
+        topk_weights=torch.ones((2, 2)),
+    )
+    with pytest.raises(RuntimeError, match="unconsumed dispatch"):
+        connector.close()
+    assert b"unconsumed dispatch" in connector.window.runtime.store.get(
+        FAILURE_STORE_KEY
+    )
+    with pytest.raises(RuntimeError, match="peer failed.*unconsumed dispatch"):
+        connector.close()
+    assert not connector.window.closed
+
+
+def test_close_fails_when_a_peer_reports_failed_drain(connector):
+    connector.window.runtime.store.set(
+        FAILURE_STORE_KEY, "rank 3: receiver did not drain"
+    )
+    with pytest.raises(RuntimeError, match="peer failed.*rank 3"):
+        connector.close()
+    assert not connector.window.closed
+
+
+def test_close_deadline_publishes_failure_when_peer_never_arrives(
+    connector, monkeypatch
+):
+    connector.is_attention = False
+    connector.receiver_finished = True
+    clock = iter((0.0, float(connector.afd_config.afd_process_group_timeout_s)))
+    monkeypatch.setattr(
+        "afd_plugin.connectors.gpu.async_nvshmem.connector.time",
+        SimpleNamespace(monotonic=lambda: next(clock)),
+    )
+    with pytest.raises(TimeoutError, match="close timed out"):
+        connector.close()
+    assert b"close timed out" in connector.window.runtime.store.get(FAILURE_STORE_KEY)
+    assert not connector.window.closed

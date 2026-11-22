@@ -6,18 +6,26 @@ This records wire writes; it supplies no evidence about CUDA memory ordering.
 """
 
 from collections import deque
+from types import SimpleNamespace
 
 import torch
 
 
 class RecordingAsyncWindow:
-    def __init__(self, *, arrivals=(), replies=None, defer_headers=False):
+    def __init__(self, *, arrivals=(), replies=None, defer_headers=False, store=None):
         self.device = torch.device("cpu")
         self.defer_headers = defer_headers
         self.messages = []
         self.arrivals = deque(arrivals)
         self.replies = replies or {}
         self.events = []
+        self.runtime = SimpleNamespace(
+            store=store if store is not None else torch.distributed.HashStore()
+        )
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
     def write_slot(self, **fields):
         self.messages.append(

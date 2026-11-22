@@ -20,6 +20,7 @@ from afd_plugin.connectors.base import ConnectorExtraInfo
 HEADER_MAGIC = 0x41464447
 HEADER_VERSION = 5
 HEADER_HOST_WORDS = 5
+H_NUM_TOKENS = 3
 H_ROUTED_TOKENS = 5
 H_SEGMENT_START = 6
 HEADER_FIXED_WORDS = 7

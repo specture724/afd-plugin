@@ -492,3 +492,26 @@ remain unqualified; the V4 recipe is still a candidate. Two-node device oracles 
 cover the remote transport entry point.
 The [prefill imbalance benchmark](../async_gpu_prefill_benchmark.md) compares
 both synchronous GPU connectors on identical cross-node workloads.
+
+### Async GPU failure and header lifetime
+
+Async NVSHMEM keeps one dispatch header per `(stage_idx, layer_idx)`. Each
+send rewrites its token count and routing fields on the owning stage stream;
+CUDA graphs capture these writes, so different captured batch sizes reuse the
+same bounded cache without replaying stale lengths.
+
+A local FFN stop request enters drain instead of ignoring shutdown. Drain has
+an overall `afd_process_group_timeout_s` deadline even when transaction polling
+consumes its own timeout. Failed drain and close preconditions publish the first
+failure through the AFD store. Other closing ranks check that failure before
+waiting for all ready keys and retain the live window instead of entering an
+unsafe collective free. Idle FFN polls also check the store for peer failure.
+
+Both NVSHMEM and mapped reply waits have device-side deadlines that execute on
+every graph replay. Expiry traps the CUDA context; the vLLM/process supervisor
+must terminate and restart the whole AFD world. This does not recover a failed
+CUDA context or bound arbitrary failures inside native RMA/collective calls.
+The CUDA driver wait without a deadline is retired. Validation covers CPU store
+and header protocols, real GPU bounded waits in eager/graph mode, varying eager
+header allocation, and replay of multiple graph shapes in
+`tests/gpu/test_async_gpu.py`.

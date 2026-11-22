@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -50,8 +51,22 @@ __global__ void publish(char* dest, const char* src, Payload payload,
     nvshmem_quiet();
 }
 
-__global__ void wait_signal(uint64_t* signal, uint64_t value) {
-    nvshmem_signal_wait_until(signal, NVSHMEM_CMP_EQ, value);
+__device__ uint64_t global_timer() {
+    uint64_t now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    return now;
+}
+
+__global__ void wait_signal(uint64_t* signal, uint64_t value, uint64_t timeout_ns) {
+    const uint64_t start = global_timer();
+    while (!nvshmem_uint64_test(signal, NVSHMEM_CMP_EQ, value)) {
+        if (global_timer() - start >= timeout_ns) {
+            printf("AFD async GPU reply wait timed out: signal=%p expected=%llu\n",
+                   signal, static_cast<unsigned long long>(value));
+            __trap();
+        }
+        __nanosleep(1000);
+    }
 }
 
 __global__ void fetch_signals(uint64_t* signals, uint64_t* observations, int count) {
@@ -86,9 +101,11 @@ PYBIND11_MODULE(_C_gpu_async, m) {
             value, peer);
         check(cudaGetLastError());
     });
-    m.def("wait_signal", [](uintptr_t signal, uint64_t value, uintptr_t stream) {
+    m.def("wait_signal", [](uintptr_t signal, uint64_t value, uint64_t timeout_ns,
+                            uintptr_t stream) {
+        if (!timeout_ns) throw std::invalid_argument("signal wait timeout must be positive");
         wait_signal<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-            reinterpret_cast<uint64_t*>(signal), value);
+            reinterpret_cast<uint64_t*>(signal), value, timeout_ns);
         check(cudaGetLastError());
     });
     m.def("fetch_signals", [](uintptr_t signals, uintptr_t observations, int count,

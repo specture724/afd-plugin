@@ -65,7 +65,6 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from afd_plugin.connectors.gpu import cuda_rt
 from afd_plugin.connectors.gpu.async_nvshmem import nvshmem_rt
 from afd_plugin.connectors.gpu.async_nvshmem.protocol import (
     FLAG_EMPTY,
@@ -83,6 +82,8 @@ from afd_plugin.connectors.gpu.async_nvshmem.protocol import (
 
 if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
+
+NANOSECONDS_PER_SECOND = 1_000_000_000
 
 
 def fill_header_prefix(
@@ -141,6 +142,7 @@ class SymmWindow:
         group: ProcessGroup,
         rank: int,
         world_size: int,
+        wait_timeout_s: float,
         num_stages: int = 1,
     ) -> None:
         if num_regions <= 0 or ring_depth <= 0:
@@ -152,6 +154,9 @@ class SymmWindow:
         self.device = device
         self.rank = rank
         self.num_stages = num_stages
+        self.wait_timeout_ns = int(wait_timeout_s * NANOSECONDS_PER_SECOND)
+        if self.wait_timeout_ns <= 0:
+            raise ValueError("Async GPU wait timeout must be positive")
 
         self.num_flags = num_regions * ring_depth
         self._flag_bytes = align_bytes(self.num_flags * SIGNAL_WORD_BYTES)
@@ -176,7 +181,6 @@ class SymmWindow:
         self._validate_uniform_geometry(group, world_size)
 
         self.runtime = nvshmem_rt.NvshmemRuntime(group, rank, world_size)
-        self.driver = cuda_rt.CudaStreamMemoryOps()
         self._base = self.runtime.malloc(self.total_bytes)
         # Peer mappings are stable for the life of the allocation, so resolve
         # them once instead of per transfer.
@@ -257,6 +261,17 @@ class SymmWindow:
         self._poll_stream = torch.cuda.Stream(device=device)
         self._poll_stream.wait_stream(torch.cuda.current_stream(device))
         self._warm_views()
+        if self.runtime.bridge is None:
+            # Lazy CUDA-only dependency; protocol tests need neither Triton nor a GPU.
+            from afd_plugin.connectors.gpu.async_nvshmem.signal_wait import wait_signal
+
+            # Compile before capture, against a private flag no peer can change.
+            wait_signal(
+                torch.zeros(1, dtype=torch.int64, device=device),
+                0,
+                0,
+                self.wait_timeout_ns,
+            )
 
     def _validate_uniform_geometry(
         self,
@@ -613,7 +628,7 @@ class SymmWindow:
                 return None
 
     def stream_wait(self, region: int, ring: int, value: int) -> None:
-        """Block the current stream until this slot's flag reaches ``value``.
+        """Wait for a reply, failing the CUDA context if its deadline expires.
 
         The host returns immediately, so whatever it queues next -- the combine
         that consumes this slot, the next layer -- is already on the stream when
@@ -625,14 +640,13 @@ class SymmWindow:
             self.runtime.bridge.wait_signal(
                 self._base + flag_idx * SIGNAL_WORD_BYTES,
                 value,
+                self.wait_timeout_ns,
                 torch.cuda.current_stream(self.device).cuda_stream,
             )
             return
-        self.driver.stream_wait_value32(
-            torch.cuda.current_stream(self.device).cuda_stream,
-            self._base + flag_idx * SIGNAL_WORD_BYTES,
-            value,
-        )
+        from afd_plugin.connectors.gpu.async_nvshmem.signal_wait import wait_signal
+
+        wait_signal(self._flags_local, flag_idx, value, self.wait_timeout_ns)
 
     def clear_flag(self, region: int, ring: int) -> None:
         """Put one of this rank's own flags back to ``FLAG_EMPTY``.

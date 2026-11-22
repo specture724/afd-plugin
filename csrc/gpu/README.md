@@ -48,3 +48,12 @@ connector's logged allocation size to select it. NIC selection and any IBGDA
 configuration remain deployment-specific. See the
 [GPU tests](../../tests/gpu/README.md) and
 [validation record](../../docs/design/async_gpu_cross_node_research.md).
+
+Reply waits use the configured `afd_process_group_timeout_s` on the GPU, so
+CUDA Graph replay has the same deadline as eager execution. NVSHMEM uses its
+nonblocking signal test for visibility; the mapped fallback uses a system-scope
+acquire load. A missing reply traps the CUDA context and must restart the whole
+AFD world. Rebuild the Python package and native bridge together: `wait_signal`
+now requires a timeout argument. Native RMA operations and collective teardown
+still depend on the transport and process supervisor; this is not in-process
+fault recovery.

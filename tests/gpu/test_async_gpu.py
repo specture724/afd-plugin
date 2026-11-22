@@ -22,6 +22,7 @@ TOP_K = 2
 NUM_STAGES = 2
 GRAPH_REPLAYS = 3
 PROCESS_TIMEOUT_S = 120
+SIGNAL_WAIT_TIMEOUT_NS = 20_000_000
 SHARED_SCALE = 0.25
 CANCELLATION_FACTOR = 256
 WEIGHT_PERTURBATION = 0.0001
@@ -147,9 +148,10 @@ def _run_attention(connector, device, mode, replays=GRAPH_REPLAYS):
         stream.synchronize()
     _assert_outputs(outputs, inputs, mode)
     if mode == "varying":
+        allocated_before = torch.cuda.memory_allocated(device)
         # Reuse each slot after a larger batch, then grow it again. Receivers
         # must observe only the current batch's routed and shared prefixes.
-        for iteration, num_tokens in enumerate((1, NUM_TOKENS, NUM_TOKENS // 2, 1)):
+        for iteration, num_tokens in enumerate(range(1, NUM_TOKENS + 1)):
             inputs = [
                 tuple(
                     tensor[:num_tokens] for tensor in _inputs(stage, iteration, device)
@@ -160,6 +162,33 @@ def _run_attention(connector, device, mode, replays=GRAPH_REPLAYS):
             for stream in streams:
                 stream.synchronize()
             _assert_outputs(outputs, inputs, mode)
+        # Same live input/output shape as the warmed baseline, with no header
+        # allocation retained for any of the intervening eager batch sizes.
+        assert torch.cuda.memory_allocated(device) <= allocated_before
+        return
+    if mode == "graph_varying":
+        captures = []
+        for count in (1, NUM_TOKENS // 2, NUM_TOKENS):
+            buffers = [tuple(t[:count].clone() for t in values) for values in inputs]
+            warm_outputs = _roundtrip(connector, buffers, streams)
+            torch.cuda.synchronize(device)
+            _assert_outputs(warm_outputs, buffers, mode)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                stream = torch.cuda.current_stream(device)
+                captured_outputs = _roundtrip(connector, buffers, [stream] * NUM_STAGES)
+            captures.append((graph, buffers, captured_outputs))
+        for iteration in range(GRAPH_REPLAYS):
+            for graph, buffers, captured_outputs in reversed(captures):
+                for stage, (hidden, ids, weights) in enumerate(buffers):
+                    changed = _inputs(stage, iteration, device)
+                    for target, source in zip(
+                        (hidden, ids, weights), changed, strict=True
+                    ):
+                        target.copy_(source[: target.shape[0]])
+                graph.replay()
+                torch.cuda.synchronize(device)
+                _assert_outputs(captured_outputs, buffers, mode)
         return
     if mode in ("eager", "precision", "cross_rank_precision"):
         return
@@ -309,6 +338,7 @@ def _rank(
         ("graph", 1, 1),
         ("mapped_graph", 1, 1),
         ("varying", 1, 1),
+        ("graph_varying", 1, 1),
         ("precision", 1, 1),
         ("cross_rank_precision", 1, 2),
         ("independent", 2, 2),
@@ -361,4 +391,97 @@ def test_async_gpu_two_stage_transport_and_shared_outputs(  # long-test: CUDA li
             if process.is_alive():
                 process.terminate()
                 process.join()
+        results.close()
+
+
+def _missing_signal(backend, capture, store_path, results):
+    """A disposable CUDA context: timeout must fail it instead of hanging."""
+    import torch.distributed as dist
+
+    from afd_plugin.connectors.gpu.async_nvshmem.nvshmem_rt import (
+        NvshmemRuntime,
+        tensor_from_ptr,
+    )
+    from afd_plugin.connectors.gpu.async_nvshmem.signal_wait import wait_signal
+
+    try:
+        os.environ["NVSHMEM_REMOTE_TRANSPORT"] = "none"
+        torch.cuda.set_device(0)
+        if backend == "nvshmem":
+            dist.init_process_group(
+                "gloo", init_method=f"file://{store_path}", rank=0, world_size=1
+            )
+            runtime = NvshmemRuntime(dist.group.WORLD, 0, 1)
+            bridge = runtime.bridge
+            assert bridge is not None, "rebuild the GPU async extension"
+            pointer = runtime.malloc(8)
+            flags = tensor_from_ptr(
+                pointer,
+                byte_offset=0,
+                sizes=(1,),
+                dtype=torch.int64,
+                device=torch.device("cuda", 0),
+            )
+            flags.zero_()
+
+            def wait(value):
+                bridge.wait_signal(
+                    pointer,
+                    value,
+                    SIGNAL_WAIT_TIMEOUT_NS,
+                    torch.cuda.current_stream().cuda_stream,
+                )
+        else:
+            flags = torch.zeros(1, dtype=torch.int64, device="cuda")
+
+            def wait(value):
+                wait_signal(flags, 0, value, SIGNAL_WAIT_TIMEOUT_NS)
+
+        wait(0)
+        torch.cuda.synchronize()
+        if capture:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                wait(1)
+            graph.replay()
+        else:
+            wait(1)
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError as error:
+            results.put(("timeout", str(error)))
+        else:
+            results.put(("unexpected_success", "missing signal did not fail"))
+    except BaseException:
+        results.put(("setup_failure", traceback.format_exc()))
+    finally:
+        results.close()
+        results.join_thread()
+        # Device traps poison the context; collective finalization is unsafe.
+        os._exit(0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("backend", ["mapped", "nvshmem"])
+@pytest.mark.parametrize("capture", [False, True])
+def test_missing_reply_fails_device_wait_instead_of_hanging(backend, capture, tmp_path):
+    if not torch.cuda.is_available():
+        pytest.skip("requires one allocated CUDA GPU")
+    context = mp.get_context("spawn")
+    results = context.Queue()
+    process = context.Process(
+        target=_missing_signal,
+        args=(backend, capture, str(tmp_path / "world.store"), results),
+    )
+    try:
+        process.start()
+        status, error = results.get(timeout=PROCESS_TIMEOUT_S)
+        assert status == "timeout", error
+        assert "CUDA" in error
+        process.join(PROCESS_TIMEOUT_S)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join()
         results.close()
