@@ -45,7 +45,10 @@ from vllm.v1.worker.workspace import (  # noqa: E402
     reset_workspace_manager,
 )
 
-from afd_plugin.config import AFD_ASYNC_GPU_CONNECTOR, DEEPEP_M2N_CONNECTOR  # noqa: E402
+from afd_plugin.config import (  # noqa: E402
+    AFD_ASYNC_GPU_CONNECTOR,
+    DEEPEP_M2N_CONNECTOR,
+)
 from afd_plugin.connectors import AFDForwardContextMetadata  # noqa: E402
 from afd_plugin.model_executor.models import deepseek_v2 as adapter  # noqa: E402
 from tests.conftest import REPO_ROOT  # noqa: E402
