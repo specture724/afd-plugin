@@ -9,6 +9,7 @@ import os
 import socket
 import traceback
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -26,6 +27,7 @@ SIGNAL_WAIT_TIMEOUT_NS = 20_000_000
 SHARED_SCALE = 0.25
 CANCELLATION_FACTOR = 256
 WEIGHT_PERTURBATION = 0.0001
+NVSHMEM_STATUS_NOT_INITIALIZED = 0
 
 
 def _free_port() -> int:
@@ -256,6 +258,50 @@ def _run_ffn(connector, role_rank, ffn_ranks, mode):
     session.finish_receiver()
 
 
+def _init_without_bridge(connector, reject_remote):
+    import importlib.util
+
+    from afd_plugin.connectors.gpu.async_nvshmem import nvshmem_rt
+
+    find_spec = importlib.util.find_spec
+    runtime_type = nvshmem_rt.NvshmemRuntime
+    peer_ptr = runtime_type.peer_ptr
+    runtimes = []
+
+    def create_runtime(*args):
+        runtime = runtime_type(*args)
+        runtimes.append(runtime)
+        return runtime
+
+    def peer_mapping(runtime, pointer, peer):
+        # Only one rank sees an unmapped peer; every rank must still clean up.
+        if reject_remote and connector.world_rank == 0:
+            return None
+        return peer_ptr(runtime, pointer, peer)
+
+    with (
+        patch.object(
+            importlib.util,
+            "find_spec",
+            side_effect=lambda name: (
+                None if name == "afd_plugin._C_gpu_async" else find_spec(name)
+            ),
+        ),
+        patch.object(nvshmem_rt, "NvshmemRuntime", side_effect=create_runtime),
+        patch.object(runtime_type, "peer_ptr", new=peer_mapping),
+    ):
+        if reject_remote:
+            with pytest.raises(RuntimeError, match="Remote GPU peers require"):
+                connector.init_afd_connector()
+            runtime = runtimes[0]
+            assert runtime.closed
+            assert (
+                runtime.library.nvshmemx_init_status() == NVSHMEM_STATUS_NOT_INITIALIZED
+            )
+        else:
+            connector.init_afd_connector()
+
+
 def _rank(
     rank,
     port,
@@ -299,7 +345,14 @@ def _rank(
             attention_ranks,
             ffn_ranks,
         )
-        connector.init_afd_connector()
+        if mode in ("unbridged_graph", "unbridged_remote"):
+            _init_without_bridge(connector, mode == "unbridged_remote")
+            if mode == "unbridged_remote":
+                result_queue.put((rank, None))
+                return
+            mode = "graph"
+        else:
+            connector.init_afd_connector()
         if attention:
             if mode == "independent" and role_rank == 1:
                 assert first_done.wait(PROCESS_TIMEOUT_S), (
@@ -337,6 +390,8 @@ def _rank(
         ("eager", 1, 1),
         ("graph", 1, 1),
         ("mapped_graph", 1, 1),
+        ("unbridged_graph", 1, 1),
+        ("unbridged_remote", 1, 1),
         ("varying", 1, 1),
         ("graph_varying", 1, 1),
         ("precision", 1, 1),

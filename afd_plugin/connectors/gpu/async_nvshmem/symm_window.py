@@ -191,11 +191,18 @@ class SymmWindow:
         self.remote_peers = frozenset(
             pe for pe, pointer in mappings.items() if pointer is None
         )
-        if self.remote_peers and not self._has_bridge:
-            raise RuntimeError(
-                "Remote GPU peers require the CUDA/NVSHMEM extension. Reinstall "
-                "with AFD_BUILD_GPU_ASYNC_OPS=1 (see csrc/gpu/README.md)."
+        if not self._has_bridge:
+            needs_bridge = torch.tensor(
+                bool(self.remote_peers), dtype=torch.int32, device=device
             )
+            # Free/finalize is collective, including ranks with only mapped peers.
+            dist.all_reduce(needs_bridge, op=dist.ReduceOp.MAX, group=group)
+            if needs_bridge.item():
+                self.runtime.close(self._base)
+                raise RuntimeError(
+                    "Remote GPU peers require the CUDA/NVSHMEM extension. Reinstall "
+                    "with AFD_BUILD_GPU_ASYNC_OPS=1 (see csrc/gpu/README.md)."
+                )
         # Remote views refer to our symmetric outboxes; only the final put uses
         # the target PE. Never pass a mapped peer VA as an NVSHMEM RMA target.
         self._peer_base: dict[int, int] = {

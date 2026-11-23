@@ -495,6 +495,12 @@ both synchronous GPU connectors on identical cross-node workloads.
 
 ### Async GPU failure and header lifetime
 
+Without the optional CUDA bridge, startup collectively checks whether any rank
+has an unmapped peer. If so, every rank frees its symmetric allocation and
+finalizes NVSHMEM before raising the extension installation error, including
+ranks whose own peers are all mapped. This check precedes window views and
+transfers; the installed-bridge startup path is unchanged.
+
 Async NVSHMEM keeps one dispatch header per `(stage_idx, layer_idx)`. Each
 send rewrites its token count and routing fields on the owning stage stream;
 CUDA graphs capture these writes, so different captured batch sizes reuse the

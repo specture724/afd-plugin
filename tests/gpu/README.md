@@ -10,7 +10,7 @@ server. Weekly CI runs the full suite on four H100 GPUs
 | --- | --- | --- |
 | `test_deepep_m2n_gpu.py` | pytest, up to 4 GPUs on one node | Dispatch, expert compute and combine checked against references, in eager mode, with two lanes (DBO), under `torch.compile`, and after CUDA-graph replay |
 | `deepep_m2n_harness.py` | - | Multi-process harness: rank spawning, deterministic inputs, references, checks, scenarios, and benchmark scenarios |
-| `test_async_gpu.py` | pinned CUDA vLLM/Torch, NVSHMEM 3.4.5, up to 4 NVLink GPUs | Eight real transport cases plus four missing-reply deadline cases: stages, replay, bounded header memory, mapping, precision and independent producers |
+| `test_async_gpu.py` | pinned CUDA vLLM/Torch, NVSHMEM 3.4.5, up to 4 NVLink GPUs | Ten transport/startup cases plus four missing-reply deadline cases: stages, replay, bounded header memory, mapping, precision and independent producers |
 | `run_async_gpu_multinode.py` / `.slurm` | CUDA/NVSHMEM extension, two nodes with two GPUs each | The same affine oracle over remote RMA: graph counters, precision, independent producers and collective close |
 | `__init__.py` | - | Package marker |
 
@@ -22,13 +22,16 @@ The async GPU tests need no DeepEP or DeepGEMM. Run inside a four-GPU allocation
 python -m pytest -s -v tests/gpu/test_async_gpu.py
 ```
 
-All twelve cases must pass with zero skips in a four-GPU allocation. The four
+All fourteen cases must pass with zero skips in a four-GPU allocation. The four
 deadline cases use disposable processes because a device timeout deliberately
 traps the CUDA context. They cover mapped and native NVSHMEM waits, both eager
 and graph replay. With two GPUs, only the three/four-GPU transport cases skip.
 The transport cases use real CUDA transport and
 an affine expert oracle; model kernels and accuracy are covered separately in
 the [single-node validation record](../../docs/design/async_gpu_cross_node_research.md).
+Startup checks hide the optional bridge without changing the installed files:
+local peers still replay graphs, while an injected unmapped peer on one rank
+forces every rank to free/finalize NVSHMEM before rejecting the configuration.
 The requirements and harness descriptions below cover DeepEP M2N.
 
 For real two-node RDMA, first build the
